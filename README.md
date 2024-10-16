@@ -32,8 +32,8 @@ async fn main() -> Result<(), Error> {
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
             map => parse,
-            reduce_ok => ClickhouseWriter::new(host, port, table, 64, 2),
-            reduce_err => StdoutBuffer::new(64, 1),
+            reduce_ok => ClickhouseWriter::new(host, port, table, 64, Duration::from_secs(4)),
+            reduce_err => StdoutBuffer::new(64, Duration::from_secs(1)),
         }),
     )
     .await

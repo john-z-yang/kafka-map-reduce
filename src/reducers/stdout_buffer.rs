@@ -1,15 +1,15 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use crate::Reducer;
 
 pub struct StdoutBuffer<T> {
     buffer: Vec<T>,
     max_buf_size: usize,
-    flush_interval: u64,
+    flush_interval: Duration,
 }
 
 impl<T> StdoutBuffer<T> {
-    pub fn new(max_buf_size: usize, flush_interval: u64) -> Self {
+    pub fn new(max_buf_size: usize, flush_interval: Duration) -> Self {
         Self {
             buffer: Vec::with_capacity(max_buf_size),
             max_buf_size,
@@ -48,7 +48,7 @@ where
         self.buffer.len() >= self.max_buf_size
     }
 
-    fn get_flush_interval(&self) -> u64 {
+    fn get_flush_interval(&self) -> Duration {
         self.flush_interval
     }
 }

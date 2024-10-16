@@ -7,6 +7,7 @@ use kafka_map_reduce::{processing_strategy, start_consumer};
 use rdkafka::{config::RDKafkaLogLevel, message::OwnedMessage, ClientConfig, Message};
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -99,8 +100,8 @@ async fn main() -> Result<(), Error> {
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
             map => parse,
-            reduce_ok => ClickhouseWriter::new(host, port, table, 64, 2),
-            reduce_err => StdoutBuffer::new(64, 1),
+            reduce_ok => ClickhouseWriter::new(host, port, table, 64, Duration::from_secs(4)),
+            reduce_err => StdoutBuffer::new(64, Duration::from_secs(1)),
         }),
     )
     .await

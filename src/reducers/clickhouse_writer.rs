@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Ok};
 use reqwest::Client;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use tracing::info;
 
 use crate::Reducer;
@@ -10,7 +10,7 @@ pub struct ClickhouseWriter<T> {
     buffer: Vec<T>,
     http_client: Client,
     max_buf_size: usize,
-    flush_interval: u64,
+    flush_interval: Duration,
     url: String,
 }
 
@@ -20,7 +20,7 @@ impl<T> ClickhouseWriter<T> {
         port: &str,
         table: &str,
         max_buf_size: usize,
-        flush_interval: u64,
+        flush_interval: Duration,
     ) -> Self {
         Self {
             buffer: Vec::with_capacity(max_buf_size),
@@ -82,7 +82,7 @@ where
         self.buffer.len() >= self.max_buf_size
     }
 
-    fn get_flush_interval(&self) -> u64 {
+    fn get_flush_interval(&self) -> Duration {
         self.flush_interval
     }
 }

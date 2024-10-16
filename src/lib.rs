@@ -464,7 +464,7 @@ pub trait Reducer {
     fn flush(&mut self) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send;
     fn reset(&mut self);
     fn is_full(&self) -> bool;
-    fn get_flush_interval(&self) -> u64;
+    fn get_flush_interval(&self) -> Duration;
 }
 
 async fn handle_reducer_failure<T>(
@@ -517,7 +517,7 @@ pub async fn reduce<T>(
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
     let mut highwater_mark = HighwaterMark::new();
-    let mut interval = time::interval(Duration::from_secs(reducer.get_flush_interval()));
+    let mut interval = time::interval(reducer.get_flush_interval());
     let mut batched_msg = Vec::new();
 
     loop {
@@ -591,7 +591,7 @@ pub async fn reduce_err(
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
     let mut highwater_mark = HighwaterMark::new();
-    let mut interval = time::interval(Duration::from_secs(reducer.get_flush_interval()));
+    let mut interval = time::interval(reducer.get_flush_interval());
 
     loop {
         select! {
@@ -748,8 +748,8 @@ mod tests {
             self.buffer.read().unwrap().len() >= 32
         }
 
-        fn get_flush_interval(&self) -> u64 {
-            1
+        fn get_flush_interval(&self) -> Duration {
+            Duration::from_secs(1)
         }
     }
 
@@ -814,8 +814,8 @@ mod tests {
             false
         }
 
-        fn get_flush_interval(&self) -> u64 {
-            1
+        fn get_flush_interval(&self) -> Duration {
+            Duration::from_secs(1)
         }
     }
 
