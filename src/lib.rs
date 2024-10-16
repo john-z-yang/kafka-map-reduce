@@ -164,7 +164,7 @@ macro_rules! processing_strategy {
     (
         {
             map => $map_fn:ident,
-            reduce_ok => $reduce_ok:expr,
+            reduce => $reduce:expr,
             reduce_err => $reduce_err:expr$(,)?
         }
     ) => {{
@@ -176,12 +176,11 @@ macro_rules! processing_strategy {
 
             let (rendezvous_sender, rendezvous_receiver) = tokio::sync::oneshot::channel();
 
-            let ok_reducer = $reduce_ok;
+            let reducer = $reduce;
             let err_reducer = $reduce_err;
 
             const MAX_CHANNEL_BUF_SIZE: usize = 1048576;
-            let (map_ok_sender, reduce_ok_receiver) =
-                tokio::sync::mpsc::channel(MAX_CHANNEL_BUF_SIZE);
+            let (reduce_sender, reduce_receiver) = tokio::sync::mpsc::channel(MAX_CHANNEL_BUF_SIZE);
             let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(MAX_CHANNEL_BUF_SIZE);
             let (err_sender, err_receiver) = tokio::sync::mpsc::channel(MAX_CHANNEL_BUF_SIZE);
 
@@ -193,15 +192,15 @@ macro_rules! processing_strategy {
                 handles.spawn($crate::map(
                     queue,
                     $map_fn,
-                    map_ok_sender.clone(),
+                    reduce_sender.clone(),
                     err_sender.clone(),
                     shutdown_signal.clone(),
                 ));
             }
 
             handles.spawn($crate::reduce(
-                ok_reducer,
-                reduce_ok_receiver,
+                reducer,
+                reduce_receiver,
                 commit_sender.clone(),
                 err_sender.clone(),
                 shutdown_signal.clone(),
