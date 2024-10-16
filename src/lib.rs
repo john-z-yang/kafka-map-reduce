@@ -38,7 +38,7 @@ pub mod reducers;
 pub async fn start_consumer(
     topics: &[&str],
     kafka_client_config: &ClientConfig,
-    spawn_actors: impl Fn(Arc<StreamConsumer<KafkaContext>>, &[(String, i32)]) -> ActorHandles,
+    spawn_actors: impl FnMut(Arc<StreamConsumer<KafkaContext>>, &[(String, i32)]) -> ActorHandles,
 ) -> Result<(), Error> {
     let (client_shutdown_sender, client_shutdown_receiver) = oneshot::channel();
     let (event_sender, event_receiver) = unbounded_channel();
@@ -236,7 +236,7 @@ pub async fn handle_events(
     consumer: Arc<StreamConsumer<KafkaContext>>,
     events: UnboundedReceiver<(Event, SyncSender<()>)>,
     shutdown_client: oneshot::Sender<()>,
-    spawn_actors: impl Fn(Arc<StreamConsumer<KafkaContext>>, &[(String, i32)]) -> ActorHandles,
+    mut spawn_actors: impl FnMut(Arc<StreamConsumer<KafkaContext>>, &[(String, i32)]) -> ActorHandles,
 ) -> Result<(), anyhow::Error> {
     const CALLBACK_DURATION: Duration = Duration::from_secs(1);
 
