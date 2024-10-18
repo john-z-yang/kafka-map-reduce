@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Error};
 use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
-use kafka_map_reduce::reducers::clickhouse_writer::ClickhouseWriter;
-use kafka_map_reduce::reducers::stdout_buffer::StdoutBuffer;
+use kafka_map_reduce::reducers::clickhouse::ClickhouseWriter;
+use kafka_map_reduce::reducers::stdout::StdoutWriter;
 use kafka_map_reduce::{processing_strategy, start_consumer};
 use rdkafka::{config::RDKafkaLogLevel, message::OwnedMessage, ClientConfig, Message};
 use serde::Serialize;
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Error> {
         processing_strategy!({
             map => parse,
             reduce => ClickhouseWriter::new(host, port, table, 64, Duration::from_secs(4)),
-            reduce_err => StdoutBuffer::new(64, Duration::from_secs(1)),
+            reduce_err => StdoutWriter::new(64, Duration::from_secs(1)),
         }),
     )
     .await

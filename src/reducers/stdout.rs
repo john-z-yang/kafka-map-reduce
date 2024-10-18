@@ -2,13 +2,13 @@ use std::{fmt::Debug, time::Duration};
 
 use crate::Reducer;
 
-pub struct StdoutBuffer<T> {
+pub struct StdoutWriter<T> {
     buffer: Vec<T>,
     max_buf_size: usize,
     flush_interval: Duration,
 }
 
-impl<T> StdoutBuffer<T> {
+impl<T> StdoutWriter<T> {
     pub fn new(max_buf_size: usize, flush_interval: Duration) -> Self {
         Self {
             buffer: Vec::with_capacity(max_buf_size),
@@ -18,7 +18,7 @@ impl<T> StdoutBuffer<T> {
     }
 }
 
-impl<T> Reducer for StdoutBuffer<T>
+impl<T> Reducer for StdoutWriter<T>
 where
     T: Debug + Send,
 {

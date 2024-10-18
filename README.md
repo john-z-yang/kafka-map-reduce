@@ -33,7 +33,7 @@ async fn main() -> Result<(), Error> {
         processing_strategy!({
             map => parse,
             reduce => ClickhouseWriter::new(host, port, table, 64, Duration::from_secs(4)),
-            reduce_err => StdoutBuffer::new(64, Duration::from_secs(1)),
+            reduce_err => StdoutWriter::new(64, Duration::from_secs(1)),
         }),
     )
     .await
