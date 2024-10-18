@@ -456,6 +456,18 @@ impl From<HighwaterMark> for TopicPartitionList {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ReduceConfig {
+    pub shutdown_behaviour: ReduceShutdownBehaviour,
+    pub flush_interval: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReduceShutdownBehaviour {
+    Flush,
+    Drop,
+}
+
 pub trait Reducer {
     type Item;
 
@@ -463,7 +475,7 @@ pub trait Reducer {
     fn flush(&mut self) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send;
     fn reset(&mut self);
     fn is_full(&self) -> bool;
-    fn get_flush_interval(&self) -> Duration;
+    fn get_reduce_config(&self) -> ReduceConfig;
 }
 
 async fn handle_reducer_failure<T>(
@@ -515,8 +527,10 @@ pub async fn reduce<T>(
     err: mpsc::Sender<OwnedMessage>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
+    let config = reducer.get_reduce_config();
+    let mut interval = time::interval(config.flush_interval);
+
     let mut highwater_mark = HighwaterMark::new();
-    let mut interval = time::interval(reducer.get_flush_interval());
     let mut batched_msg = Vec::new();
 
     loop {
@@ -524,14 +538,22 @@ pub async fn reduce<T>(
             biased;
 
             _ = shutdown.cancelled() => {
-                debug!("Received shutdown signal, flushing batch...");
-                flush_reducer(
-                    &mut reducer,
-                    &mut batched_msg,
-                    &mut highwater_mark,
-                    &ok,
-                    &err
-                ).await?;
+                match config.shutdown_behaviour {
+                    ReduceShutdownBehaviour::Flush => {
+                        debug!("Received shutdown signal, flushing batch...");
+                        flush_reducer(
+                            &mut reducer,
+                            &mut batched_msg,
+                            &mut highwater_mark,
+                            &ok,
+                            &err
+                        ).await?;
+                    },
+                    ReduceShutdownBehaviour::Drop => {
+                        debug!("Received shutdown signal, dropping batch...");
+                        drop(reducer);
+                    },
+                }
                 break;
             }
 
@@ -589,19 +611,29 @@ pub async fn reduce_err(
     ok: mpsc::Sender<TopicPartitionList>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
+    let config = reducer.get_reduce_config();
+    let mut interval = time::interval(config.flush_interval);
+
     let mut highwater_mark = HighwaterMark::new();
-    let mut interval = time::interval(reducer.get_flush_interval());
 
     loop {
         select! {
             biased;
 
             _ = shutdown.cancelled() => {
-                debug!("Received shutdown signal, flushing batch...");
-                reducer
-                    .flush()
-                    .await
-                    .expect("error reducer flush should always be successful");
+                match config.shutdown_behaviour {
+                    ReduceShutdownBehaviour::Flush => {
+                        debug!("Received shutdown signal, flushing batch...");
+                        reducer
+                            .flush()
+                            .await
+                            .expect("error reducer flush should always be successful");
+                    },
+                    ReduceShutdownBehaviour::Drop => {
+                        debug!("Received shutdown signal, dropping batch...");
+                        drop(reducer);
+                    },
+                }
                 break;
             }
 
@@ -685,7 +717,9 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use crate::{commit, reduce, reduce_err, CommitClient, Reducer};
+    use crate::{
+        commit, reduce, reduce_err, CommitClient, ReduceConfig, ReduceShutdownBehaviour, Reducer,
+    };
 
     struct MockCommitClient {
         offsets: Arc<RwLock<Vec<TopicPartitionList>>>,
@@ -747,8 +781,11 @@ mod tests {
             self.buffer.read().unwrap().len() >= 32
         }
 
-        fn get_flush_interval(&self) -> Duration {
-            Duration::from_secs(1)
+        fn get_reduce_config(&self) -> crate::ReduceConfig {
+            ReduceConfig {
+                shutdown_behaviour: ReduceShutdownBehaviour::Flush,
+                flush_interval: Duration::from_secs(1),
+            }
         }
     }
 
@@ -813,8 +850,11 @@ mod tests {
             false
         }
 
-        fn get_flush_interval(&self) -> Duration {
-            Duration::from_secs(1)
+        fn get_reduce_config(&self) -> ReduceConfig {
+            ReduceConfig {
+                shutdown_behaviour: ReduceShutdownBehaviour::Flush,
+                flush_interval: Duration::from_secs(1),
+            }
         }
     }
 

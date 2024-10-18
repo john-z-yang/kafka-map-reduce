@@ -3,7 +3,9 @@ use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
 use kafka_map_reduce::reducers::clickhouse::ClickhouseWriter;
 use kafka_map_reduce::reducers::stdout::StdoutWriter;
-use kafka_map_reduce::{processing_strategy, start_consumer};
+use kafka_map_reduce::{
+    processing_strategy, start_consumer, ReduceConfig, ReduceShutdownBehaviour,
+};
 use rdkafka::{config::RDKafkaLogLevel, message::OwnedMessage, ClientConfig, Message};
 use serde::Serialize;
 use std::sync::Arc;
@@ -100,8 +102,23 @@ async fn main() -> Result<(), Error> {
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
             map => parse,
-            reduce => ClickhouseWriter::new(host, port, table, 64, Duration::from_secs(4)),
-            reduce_err => StdoutWriter::new(64, Duration::from_secs(1)),
+            reduce => ClickhouseWriter::new(
+                host,
+                port,
+                table,
+                64,
+                ReduceConfig {
+                    flush_interval: Duration::from_secs(4),
+                    shutdown_behaviour: ReduceShutdownBehaviour::Drop
+                }
+            ),
+            reduce_err => StdoutWriter::new(
+                64,
+                ReduceConfig {
+                    flush_interval: Duration::from_secs(1),
+                    shutdown_behaviour: ReduceShutdownBehaviour::Flush
+                }
+            ),
         }),
     )
     .await

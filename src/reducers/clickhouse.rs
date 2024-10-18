@@ -1,17 +1,17 @@
 use anyhow::{anyhow, Ok};
 use reqwest::Client;
 use serde::Serialize;
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 use tracing::info;
 
-use crate::Reducer;
+use crate::{ReduceConfig, Reducer};
 
 pub struct ClickhouseWriter<T> {
     buffer: Vec<T>,
     http_client: Client,
     max_buf_size: usize,
-    flush_interval: Duration,
     url: String,
+    reduce_config: ReduceConfig,
 }
 
 impl<T> ClickhouseWriter<T> {
@@ -20,17 +20,17 @@ impl<T> ClickhouseWriter<T> {
         port: &str,
         table: &str,
         max_buf_size: usize,
-        flush_interval: Duration,
+        reduce_config: ReduceConfig,
     ) -> Self {
         Self {
             buffer: Vec::with_capacity(max_buf_size),
             http_client: Client::new(),
             max_buf_size,
-            flush_interval,
             url: format!(
                 "http://{}:{}/?query=INSERT%20INTO%20{}%20FORMAT%20JSONEachRow",
                 host, port, table
             ),
+            reduce_config,
         }
     }
 }
@@ -82,7 +82,7 @@ where
         self.buffer.len() >= self.max_buf_size
     }
 
-    fn get_flush_interval(&self) -> Duration {
-        self.flush_interval
+    fn get_reduce_config(&self) -> ReduceConfig {
+        self.reduce_config.clone()
     }
 }

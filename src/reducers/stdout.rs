@@ -1,19 +1,19 @@
-use std::{fmt::Debug, time::Duration};
+use std::fmt::Debug;
 
-use crate::Reducer;
+use crate::{ReduceConfig, Reducer};
 
 pub struct StdoutWriter<T> {
     buffer: Vec<T>,
     max_buf_size: usize,
-    flush_interval: Duration,
+    reduce_config: ReduceConfig,
 }
 
 impl<T> StdoutWriter<T> {
-    pub fn new(max_buf_size: usize, flush_interval: Duration) -> Self {
+    pub fn new(max_buf_size: usize, reduce_config: ReduceConfig) -> Self {
         Self {
             buffer: Vec::with_capacity(max_buf_size),
             max_buf_size,
-            flush_interval,
+            reduce_config,
         }
     }
 }
@@ -48,7 +48,7 @@ where
         self.buffer.len() >= self.max_buf_size
     }
 
-    fn get_flush_interval(&self) -> Duration {
-        self.flush_interval
+    fn get_reduce_config(&self) -> ReduceConfig {
+        self.reduce_config.clone()
     }
 }
