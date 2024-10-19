@@ -1,2 +1,2 @@
 pub mod clickhouse;
-pub mod stdout;
+pub mod os_stream;

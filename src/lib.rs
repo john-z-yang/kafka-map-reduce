@@ -471,7 +471,10 @@ pub enum ReduceShutdownBehaviour {
 pub trait Reducer {
     type Item;
 
-    fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error>;
+    fn reduce(
+        &mut self,
+        t: Self::Item,
+    ) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send;
     fn flush(&mut self) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send;
     fn reset(&mut self);
     fn is_full(&self) -> bool;
@@ -582,7 +585,7 @@ pub async fn reduce<T>(
                 highwater_mark.track(&msg);
                 batched_msg.push(msg);
 
-                if let Err(e) = reducer.reduce(value) {
+                if let Err(e) = reducer.reduce(value).await {
                     error!(
                         "Failed to reduce message at (topic: {}, partition: {}, offset: {}), reason: {}",
                         batched_msg.last().unwrap().topic(),
@@ -664,6 +667,7 @@ pub async fn reduce_err(
 
                 reducer
                     .reduce(msg)
+                    .await
                     .expect("error reducer reduce should always be successful");
             }
         }
@@ -760,7 +764,7 @@ mod tests {
     {
         type Item = T;
 
-        fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+        async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
             self.buffer.write().unwrap().push(t);
             Ok(())
         }
@@ -826,7 +830,7 @@ mod tests {
     impl Reducer for MockAlwaysErrReducer {
         type Item = ();
 
-        fn reduce(&mut self, _: Self::Item) -> Result<(), anyhow::Error> {
+        async fn reduce(&mut self, _: Self::Item) -> Result<(), anyhow::Error> {
             self.num_reduce.fetch_add(1, Ordering::Relaxed);
             match self.failure {
                 ReducerFailure::FailOnReduce => Err(anyhow!("Oops")),

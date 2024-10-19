@@ -37,17 +37,12 @@ async fn main() -> Result<(), Error> {
                 port,
                 table,
                 64,
-                ReduceConfig {
-                    flush_interval: Duration::from_secs(4),
-                    shutdown_behaviour: ReduceShutdownBehaviour::Drop
-                }
+                Duration::from_secs(4),
+                ReduceShutdownBehaviour::Drop,
             ),
-            reduce_err => StdoutWriter::new(
-                64,
-                ReduceConfig {
-                    flush_interval: Duration::from_secs(1),
-                    shutdown_behaviour: ReduceShutdownBehaviour::Flush
-                }
+            reduce_err => OsStreamWriter::new(
+                Duration::from_secs(1),
+                OsStream::StdErr,
             ),
         }),
     )

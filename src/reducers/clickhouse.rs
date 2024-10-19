@@ -1,10 +1,9 @@
+use crate::{ReduceConfig, ReduceShutdownBehaviour, Reducer};
 use anyhow::{anyhow, Ok};
 use reqwest::Client;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use tracing::info;
-
-use crate::{ReduceConfig, Reducer};
 
 pub struct ClickhouseWriter<T> {
     buffer: Vec<T>,
@@ -20,7 +19,8 @@ impl<T> ClickhouseWriter<T> {
         port: &str,
         table: &str,
         max_buf_size: usize,
-        reduce_config: ReduceConfig,
+        flush_interval: Duration,
+        shutdown_behaviour: ReduceShutdownBehaviour,
     ) -> Self {
         Self {
             buffer: Vec::with_capacity(max_buf_size),
@@ -30,7 +30,10 @@ impl<T> ClickhouseWriter<T> {
                 "http://{}:{}/?query=INSERT%20INTO%20{}%20FORMAT%20JSONEachRow",
                 host, port, table
             ),
-            reduce_config,
+            reduce_config: ReduceConfig {
+                shutdown_behaviour,
+                flush_interval,
+            },
         }
     }
 }
@@ -41,7 +44,7 @@ where
 {
     type Item = T;
 
-    fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+    async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
         self.buffer.push(t);
         Ok(())
     }

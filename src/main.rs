@@ -2,15 +2,12 @@ use anyhow::{anyhow, Error};
 use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
 use kafka_map_reduce::reducers::clickhouse::ClickhouseWriter;
-use kafka_map_reduce::reducers::stdout::StdoutWriter;
-use kafka_map_reduce::{
-    processing_strategy, start_consumer, ReduceConfig, ReduceShutdownBehaviour,
-};
+use kafka_map_reduce::reducers::os_stream::{OsStream, OsStreamWriter};
+use kafka_map_reduce::{processing_strategy, start_consumer, ReduceShutdownBehaviour};
 use rdkafka::{config::RDKafkaLogLevel, message::OwnedMessage, ClientConfig, Message};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug, Serialize)]
@@ -35,7 +32,7 @@ async fn parse(msg: Arc<OwnedMessage>) -> Result<Data, Error> {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(tracing::Level::DEBUG)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
@@ -107,17 +104,12 @@ async fn main() -> Result<(), Error> {
                 port,
                 table,
                 64,
-                ReduceConfig {
-                    flush_interval: Duration::from_secs(4),
-                    shutdown_behaviour: ReduceShutdownBehaviour::Drop
-                }
+                Duration::from_secs(4),
+                ReduceShutdownBehaviour::Drop,
             ),
-            reduce_err => StdoutWriter::new(
-                64,
-                ReduceConfig {
-                    flush_interval: Duration::from_secs(1),
-                    shutdown_behaviour: ReduceShutdownBehaviour::Flush
-                }
+            reduce_err => OsStreamWriter::new(
+                Duration::from_secs(1),
+                OsStream::StdErr,
             ),
         }),
     )
