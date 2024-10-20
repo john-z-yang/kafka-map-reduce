@@ -827,7 +827,10 @@ mod tests {
     use rdkafka::{
         error::KafkaResult, message::OwnedMessage, Message, Offset, Timestamp, TopicPartitionList,
     };
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::{
+        sync::{mpsc, oneshot},
+        time::sleep,
+    };
     use tokio_util::sync::CancellationToken;
 
     use crate::{
@@ -846,20 +849,20 @@ mod tests {
     }
 
     struct StreamingReducer<T> {
-        output: Arc<RwLock<Vec<T>>>,
+        pipe: Arc<RwLock<Vec<T>>>,
         error_on_idx: Option<usize>,
     }
 
     impl<T> StreamingReducer<T> {
         fn new(error_on_idx: Option<usize>) -> Self {
             Self {
-                output: Arc::new(RwLock::new(Vec::new())),
+                pipe: Arc::new(RwLock::new(Vec::new())),
                 error_on_idx,
             }
         }
 
-        fn get_output(&self) -> Arc<RwLock<Vec<T>>> {
-            self.output.clone()
+        fn get_pipe(&self) -> Arc<RwLock<Vec<T>>> {
+            self.pipe.clone()
         }
     }
 
@@ -871,12 +874,12 @@ mod tests {
 
         async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
             if let Some(idx) = self.error_on_idx {
-                if idx == self.output.read().unwrap().len() {
+                if idx == self.pipe.read().unwrap().len() {
                     self.error_on_idx.take();
                     return Err(anyhow!("err"));
                 }
             }
-            self.output.write().unwrap().push(t);
+            self.pipe.write().unwrap().push(t);
             Ok(())
         }
 
@@ -1005,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn test_reduce_err_without_flush_interval() {
         let reducer = StreamingReducer::new(None);
-        let output = reducer.get_output();
+        let pipe = reducer.get_pipe();
 
         let (sender, receiver) = mpsc::channel(1);
         let (commit_sender, mut commit_receiver) = mpsc::channel(1);
@@ -1038,18 +1041,21 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            output.read().unwrap().last().unwrap().payload().unwrap(),
+            pipe.read().unwrap().last().unwrap().payload().unwrap(),
             &[0, 1, 2, 3, 4, 5, 6, 7]
         );
 
         drop(sender);
         shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(commit_receiver.is_closed());
     }
 
     #[tokio::test]
     async fn test_reduce_without_flush_interval() {
         let reducer = StreamingReducer::new(None);
-        let output = reducer.get_output();
+        let pipe = reducer.get_pipe();
 
         let (sender, receiver) = mpsc::channel(2);
         let (ok_sender, mut ok_receiver) = mpsc::channel(2);
@@ -1102,17 +1108,21 @@ mod tests {
             )]))
             .unwrap()
         );
-        assert_eq!(output.read().unwrap().as_slice(), &[1, 2]);
+        assert_eq!(pipe.read().unwrap().as_slice(), &[1, 2]);
         assert!(err_receiver.is_empty());
 
         drop(sender);
         shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(ok_receiver.is_closed());
+        assert!(err_receiver.is_closed());
     }
 
     #[tokio::test]
     async fn test_fail_on_reduce_without_flush_interval() {
         let reducer = StreamingReducer::new(Some(1));
-        let output = reducer.get_output();
+        let pipe = reducer.get_pipe();
 
         let (sender, receiver) = mpsc::channel(2);
         let (ok_sender, mut ok_receiver) = mpsc::channel(2);
@@ -1137,6 +1147,15 @@ mod tests {
             1,
             None,
         );
+        let msg_2 = OwnedMessage::new(
+            Some(vec![0, 0, 0, 0]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            2,
+            None,
+        );
 
         tokio::spawn(reduce(
             reducer,
@@ -1147,8 +1166,6 @@ mod tests {
         ));
 
         assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
-        assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
-
         assert_eq!(
             ok_receiver.recv().await.unwrap(),
             TopicPartitionList::from_topic_map(&HashMap::from([(
@@ -1157,16 +1174,35 @@ mod tests {
             )]))
             .unwrap()
         );
+        assert_eq!(pipe.read().unwrap().as_slice(), &[1]);
+
+        assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
         assert_eq!(
             err_receiver.recv().await.unwrap().payload(),
             msg_1.payload()
         );
+        assert_eq!(pipe.read().unwrap().as_slice(), &[1]);
+
+        assert!(sender.send((msg_2.clone(), 3)).await.is_ok());
+        assert_eq!(
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(3)
+            )]))
+            .unwrap()
+        );
+        assert_eq!(pipe.read().unwrap().as_slice(), &[1, 3]);
+
         assert!(ok_receiver.is_empty());
         assert!(err_receiver.is_empty());
-        assert_eq!(output.read().unwrap().as_slice(), &[1]);
 
         drop(sender);
         shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(ok_receiver.is_closed());
+        assert!(err_receiver.is_closed());
     }
 
     #[tokio::test]
@@ -1205,13 +1241,14 @@ mod tests {
             )]))
             .unwrap()
         );
+        assert_eq!(pipe.read().unwrap()[0].payload(), msg.payload());
+        assert!(buffer.read().unwrap().is_empty());
 
         drop(sender);
         shutdown.cancel();
 
-        assert!(buffer.read().unwrap().is_empty());
-        assert_eq!(pipe.read().unwrap().len(), 1);
-        assert_eq!(pipe.read().unwrap()[0].payload(), msg.payload());
+        sleep(Duration::from_secs(1)).await;
+        assert!(commit_receiver.is_closed());
     }
 
     #[tokio::test]
@@ -1269,15 +1306,21 @@ mod tests {
 
         drop(sender);
         shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(ok_receiver.is_closed());
+        assert!(err_receiver.is_closed());
     }
 
     #[tokio::test]
     async fn test_fail_on_reduce_with_flush_interval() {
         let reducer = BatchingReducer::new(Some(1), None);
+        let buffer = reducer.get_buffer();
+        let pipe = reducer.get_pipe();
 
-        let (sender, receiver) = mpsc::channel(1);
-        let (ok_sender, mut ok_receiver) = mpsc::channel(1);
-        let (err_sender, mut err_receiver) = mpsc::channel(1);
+        let (sender, receiver) = mpsc::channel(3);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(3);
+        let (err_sender, mut err_receiver) = mpsc::channel(3);
         let shutdown = CancellationToken::new();
 
         let msg_0 = OwnedMessage::new(
@@ -1316,8 +1359,7 @@ mod tests {
             shutdown.clone(),
         ));
 
-        assert!(sender.send((msg_0.clone(), ())).await.is_ok());
-
+        assert!(sender.send((msg_0.clone(), 0)).await.is_ok());
         assert_eq!(
             ok_receiver.recv().await.unwrap(),
             TopicPartitionList::from_topic_map(&HashMap::from([(
@@ -1326,15 +1368,18 @@ mod tests {
             )]))
             .unwrap()
         );
+        assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
+        assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
-        assert!(sender.send((msg_1.clone(), ())).await.is_ok());
+        assert!(sender.send((msg_1.clone(), 1)).await.is_ok());
         assert_eq!(
             err_receiver.recv().await.unwrap().payload(),
             msg_1.payload()
         );
+        assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
+        assert_eq!(pipe.read().unwrap().as_slice(), &[0] as &[i32]);
 
-        assert!(sender.send((msg_2.clone(), ())).await.is_ok());
-
+        assert!(sender.send((msg_2.clone(), 2)).await.is_ok());
         assert_eq!(
             ok_receiver.recv().await.unwrap(),
             TopicPartitionList::from_topic_map(&HashMap::from([(
@@ -1343,16 +1388,22 @@ mod tests {
             )]))
             .unwrap()
         );
+        assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
+        assert_eq!(pipe.read().unwrap().as_slice(), &[0, 2] as &[i32]);
 
         drop(sender);
         shutdown.cancel();
 
+        sleep(Duration::from_secs(1)).await;
         assert!(ok_receiver.is_empty());
+        assert!(err_receiver.is_empty());
     }
 
     #[tokio::test]
     async fn test_fail_on_flush() {
         let reducer = BatchingReducer::new(None, Some(1));
+        let buffer = reducer.get_buffer();
+        let pipe = reducer.get_pipe();
 
         let (sender, receiver) = mpsc::channel(1);
         let (ok_sender, mut ok_receiver) = mpsc::channel(1);
@@ -1404,7 +1455,7 @@ mod tests {
             shutdown.clone(),
         ));
 
-        assert!(sender.send((msg_0.clone(), ())).await.is_ok());
+        assert!(sender.send((msg_0.clone(), 0)).await.is_ok());
 
         assert_eq!(
             ok_receiver.recv().await.unwrap(),
@@ -1414,9 +1465,11 @@ mod tests {
             )]))
             .unwrap()
         );
+        assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
+        assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
-        assert!(sender.send((msg_1.clone(), ())).await.is_ok());
-        assert!(sender.send((msg_2.clone(), ())).await.is_ok());
+        assert!(sender.send((msg_1.clone(), 1)).await.is_ok());
+        assert!(sender.send((msg_2.clone(), 2)).await.is_ok());
         assert_eq!(
             err_receiver.recv().await.unwrap().payload(),
             msg_1.payload()
@@ -1425,8 +1478,10 @@ mod tests {
             err_receiver.recv().await.unwrap().payload(),
             msg_2.payload()
         );
+        assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
+        assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
-        assert!(sender.send((msg_3, ())).await.is_ok());
+        assert!(sender.send((msg_3, 3)).await.is_ok());
         assert_eq!(
             ok_receiver.recv().await.unwrap(),
             TopicPartitionList::from_topic_map(&HashMap::from([(
@@ -1435,11 +1490,14 @@ mod tests {
             )]))
             .unwrap()
         );
-
-        assert!(ok_receiver.is_empty());
-        assert!(err_receiver.is_empty());
+        assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
+        assert_eq!(pipe.read().unwrap().as_slice(), &[0, 3]);
 
         drop(sender);
         shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(ok_receiver.is_empty());
+        assert!(err_receiver.is_empty());
     }
 }
