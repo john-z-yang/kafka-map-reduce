@@ -105,7 +105,7 @@ async fn main() -> Result<(), Error> {
                 table,
                 64,
                 Duration::from_secs(4),
-                ReduceShutdownBehaviour::Drop,
+                ReduceShutdownBehaviour::Flush,
             ),
             reduce_err => OsStreamWriter::new(
                 Duration::from_secs(1),
