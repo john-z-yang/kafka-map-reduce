@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Error};
-use futures::{pin_mut, Stream, StreamExt};
+use futures::{
+    future::{self},
+    pin_mut, Stream, StreamExt,
+};
 use rdkafka::{
     consumer::{
         stream_consumer::StreamPartitionQueue, Consumer, ConsumerContext, Rebalance, StreamConsumer,
@@ -30,7 +33,7 @@ use tokio::{
     time::{self, sleep},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{either::Either, sync::CancellationToken};
 use tracing::{debug, error, info, instrument};
 
 pub mod reducers;
@@ -483,11 +486,11 @@ pub trait Reducer {
 
 async fn handle_reducer_failure<T>(
     reducer: &mut impl Reducer<Item = T>,
-    batched_msg: &mut Vec<OwnedMessage>,
+    inflight_msgs: &mut Vec<OwnedMessage>,
     highwater_mark: &mut HighwaterMark,
     err: &mpsc::Sender<OwnedMessage>,
 ) {
-    for msg in take(batched_msg).into_iter() {
+    for msg in take(inflight_msgs).into_iter() {
         err.send(msg)
             .await
             .expect("reduce_err should always be available");
@@ -496,11 +499,11 @@ async fn handle_reducer_failure<T>(
     reducer.reset();
 }
 
-#[instrument(skip(reducer, batched_msg, highwater_mark, ok, err))]
+#[instrument(skip(reducer, inflight_msgs, highwater_mark, ok, err))]
 async fn shutdown_reducer<T>(
     shutdown_behaviour: ReduceShutdownBehaviour,
     mut reducer: impl Reducer<Item = T>,
-    batched_msg: &mut Vec<OwnedMessage>,
+    inflight_msgs: &mut Vec<OwnedMessage>,
     highwater_mark: &mut HighwaterMark,
     ok: &mpsc::Sender<TopicPartitionList>,
     err: &mpsc::Sender<OwnedMessage>,
@@ -508,7 +511,7 @@ async fn shutdown_reducer<T>(
     match shutdown_behaviour {
         ReduceShutdownBehaviour::Flush => {
             debug!("Received shutdown signal, flushing reducer...");
-            flush_reducer(&mut reducer, batched_msg, highwater_mark, ok, err).await?;
+            flush_reducer(&mut reducer, inflight_msgs, highwater_mark, ok, err).await?;
         }
         ReduceShutdownBehaviour::Drop => {
             debug!("Received shutdown signal, dropping reducer...");
@@ -518,10 +521,10 @@ async fn shutdown_reducer<T>(
     Ok(())
 }
 
-#[instrument(skip(reducer, batched_msg, highwater_mark, ok, err))]
+#[instrument(skip(reducer, inflight_msgs, highwater_mark, ok, err))]
 async fn flush_reducer<T>(
     reducer: &mut impl Reducer<Item = T>,
-    batched_msg: &mut Vec<OwnedMessage>,
+    inflight_msgs: &mut Vec<OwnedMessage>,
     highwater_mark: &mut HighwaterMark,
     ok: &mpsc::Sender<TopicPartitionList>,
     err: &mpsc::Sender<OwnedMessage>,
@@ -529,10 +532,10 @@ async fn flush_reducer<T>(
     match reducer.flush().await {
         Err(e) => {
             error!("Failed to flush reducer, reason: {}", e);
-            handle_reducer_failure(reducer, batched_msg, highwater_mark, err).await;
+            handle_reducer_failure(reducer, inflight_msgs, highwater_mark, err).await;
         }
         Ok(()) => {
-            batched_msg.clear();
+            inflight_msgs.clear();
             if !highwater_mark.is_empty() {
                 ok.send(take(highwater_mark).into())
                     .await
@@ -551,130 +554,87 @@ pub async fn reduce<T>(
     err: mpsc::Sender<OwnedMessage>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
-    let mut highwater_mark = HighwaterMark::new();
     let config = reducer.get_reduce_config();
+    let mut highwater_mark = HighwaterMark::new();
+    let mut flush_timer = config
+        .flush_interval
+        .map(|duration| time::interval(duration));
+    let mut inflight_msgs = Vec::new();
 
-    match config.flush_interval {
-        Some(interval) => {
-            let mut flush_timer = time::interval(interval);
-            let mut batched_msg = Vec::new();
+    loop {
+        select! {
+            biased;
 
-            loop {
-                select! {
-                    biased;
+            _ = shutdown.cancelled() => {
+                shutdown_reducer(
+                    config.shutdown_behaviour,
+                    reducer,
+                    &mut inflight_msgs,
+                    &mut highwater_mark,
+                    &ok,
+                    &err
+                ).await?;
+                break;
+            }
 
-                    _ = shutdown.cancelled() => {
-                        shutdown_reducer(
-                            config.shutdown_behaviour,
-                            reducer,
-                            &mut batched_msg,
-                            &mut highwater_mark,
-                            &ok,
-                            &err
-                        ).await?;
-                        break;
-                    }
+            _ = if let Some(ref mut flush_timer) = flush_timer {
+                Either::Left(flush_timer.tick())
+            } else {
+                Either::Right(future::pending::<_>())
+            } => {
+                flush_reducer(
+                    &mut reducer,
+                    &mut inflight_msgs,
+                    &mut highwater_mark,
+                    &ok,
+                    &err
+                ).await?;
+            }
 
-                    _ = flush_timer.tick() => {
-                        flush_reducer(
-                            &mut reducer,
-                            &mut batched_msg,
-                            &mut highwater_mark,
-                            &ok,
-                            &err
-                        ).await?;
-                    }
+            val = receiver.recv(), if !reducer.is_full() => {
+                let Some((msg, value)) = val else {
+                    debug!("Received end of stream, flushing reducer...");
+                    flush_reducer(
+                        &mut reducer,
+                        &mut inflight_msgs,
+                        &mut highwater_mark,
+                        &ok,
+                        &err
+                    ).await?;
+                    break;
+                };
 
-                    val = receiver.recv(), if !reducer.is_full() => {
-                        let Some((msg, value)) = val else {
-                            debug!("Received end of stream, flushing batch...");
-                            flush_reducer(
-                                &mut reducer,
-                                &mut batched_msg,
-                                &mut highwater_mark,
-                                &ok,
-                                &err
-                            ).await?;
-                            break;
-                        };
-                        highwater_mark.track(&msg);
-                        batched_msg.push(msg);
+                highwater_mark.track(&msg);
+                inflight_msgs.push(msg);
 
-                        if let Err(e) = reducer.reduce(value).await {
-                            error!(
-                                "Failed to reduce message at \
-                                (topic: {}, partition: {}, offset: {}), reason: {}",
-                                batched_msg.last().unwrap().topic(),
-                                batched_msg.last().unwrap().partition(),
-                                batched_msg.last().unwrap().offset(),
-                                e
-                            );
-                            handle_reducer_failure(
-                                &mut reducer,
-                                &mut batched_msg,
-                                &mut highwater_mark,
-                                &err
-                            ).await;
-                        }
+                if let Err(e) = reducer.reduce(value).await {
+                    error!(
+                        "Failed to reduce message at \
+                        (topic: {}, partition: {}, offset: {}), reason: {}",
+                        inflight_msgs.last().unwrap().topic(),
+                        inflight_msgs.last().unwrap().partition(),
+                        inflight_msgs.last().unwrap().offset(),
+                        e
+                    );
+                    handle_reducer_failure(
+                        &mut reducer,
+                        &mut inflight_msgs,
+                        &mut highwater_mark,
+                        &err
+                    ).await;
+                }
+
+                if flush_timer.is_none() {
+                    inflight_msgs.clear();
+                    if !highwater_mark.is_empty() {
+                        ok.send(take(&mut highwater_mark).into())
+                            .await
+                            .map_err(|err| anyhow!("{}", err))?;
                     }
                 }
             }
         }
-        None => loop {
-            select! {
-                biased;
-
-                _ = shutdown.cancelled() => {
-                    match config.shutdown_behaviour {
-                        ReduceShutdownBehaviour::Flush => {
-                            debug!("Received shutdown signal, flushing reducer...");
-                            reducer.flush().await?;
-                        },
-                        ReduceShutdownBehaviour::Drop => {
-                            debug!("Received shutdown signal, dropping reducer...");
-                            drop(reducer);
-                        },
-                    }
-                    break;
-                }
-
-                val = receiver.recv(), if !reducer.is_full() => {
-                    let Some((msg, value)) = val else {
-                        debug!("Received end of stream, flushing reducer...");
-                        flush_reducer(
-                            &mut reducer,
-                            &mut vec![],
-                            &mut highwater_mark,
-                            &ok,
-                            &err
-                        ).await?;
-                        break;
-                    };
-
-                    highwater_mark.track(&msg);
-                    if let Err(e) = reducer.reduce(value).await {
-                        error!(
-                            "Failed to reduce message at \
-                            (topic: {}, partition: {}, offset: {}), reason: {}",
-                            msg.topic(),
-                            msg.partition(),
-                            msg.offset(),
-                            e
-                        );
-
-                        handle_reducer_failure(
-                            &mut reducer,
-                            &mut vec![msg],
-                            &mut highwater_mark,
-                            &err
-                        ).await;
-                    } else {
-                        ok.send(take(&mut highwater_mark).into()).await?;
-                    }
-                }
-            }
-        },
-    };
+    }
 
     debug!("Shutdown complete");
     Ok(())
@@ -687,105 +647,75 @@ pub async fn reduce_err(
     ok: mpsc::Sender<TopicPartitionList>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
-    let mut highwater_mark = HighwaterMark::new();
     let config = reducer.get_reduce_config();
+    let mut highwater_mark = HighwaterMark::new();
+    let mut flush_timer = config
+        .flush_interval
+        .map(|duration| time::interval(duration));
 
-    match config.flush_interval {
-        Some(interval) => loop {
-            let mut flush_timer = time::interval(interval);
+    loop {
+        select! {
+            biased;
 
-            select! {
-                biased;
-
-                _ = shutdown.cancelled() => {
-                    match config.shutdown_behaviour {
-                        ReduceShutdownBehaviour::Flush => {
-                            debug!("Received shutdown signal, flushing batch...");
-                            reducer
-                                .flush()
-                                .await
-                                .expect("error reducer flush should always be successful");
-                        },
-                        ReduceShutdownBehaviour::Drop => {
-                            debug!("Received shutdown signal, dropping batch...");
-                            drop(reducer);
-                        },
-                    }
-                    break;
+            _ = shutdown.cancelled() => {
+                match config.shutdown_behaviour {
+                    ReduceShutdownBehaviour::Flush => {
+                        debug!("Received shutdown signal, flushing reducer...");
+                        reducer
+                            .flush()
+                            .await
+                            .expect("error reducer flush should always be successful");
+                    },
+                    ReduceShutdownBehaviour::Drop => {
+                        debug!("Received shutdown signal, dropping reducer...");
+                        drop(reducer);
+                    },
                 }
+                break;
+            }
 
-                _ = flush_timer.tick() => {
+            _ = if let Some(ref mut flush_timer) = flush_timer {
+                Either::Left(flush_timer.tick())
+            } else {
+                Either::Right(future::pending::<_>())
+            } => {
+                reducer
+                    .flush()
+                    .await
+                    .expect("error reducer flush should always be successful");
+
+                if !highwater_mark.is_empty() {
+                    ok.send(take(&mut highwater_mark).into())
+                        .await
+                        .map_err(|err| anyhow!("{}", err))?;
+                }
+            }
+
+            val = receiver.recv(), if !reducer.is_full() => {
+                let Some(msg) = val else {
+                    debug!("Received end of stream, flushing reducer...");
                     reducer
                         .flush()
                         .await
                         .expect("error reducer flush should always be successful");
-
-                    if !highwater_mark.is_empty() {
-                        ok.send(take(&mut highwater_mark).into())
-                            .await
-                            .map_err(|err| anyhow!("{}", err))?;
-                    }
-                }
-
-                val = receiver.recv(), if !reducer.is_full() => {
-                    let Some(msg) = val else {
-                        debug!("Received end of stream, flushing batch...");
-                        reducer
-                            .flush()
-                            .await
-                            .expect("error reducer flush should always be successful");
-                        break;
-                    };
-                    highwater_mark.track(&msg);
-
-                    reducer
-                        .reduce(msg)
-                        .await
-                        .expect("error reducer reduce should always be successful");
-                }
-            }
-        },
-        None => loop {
-            select! {
-                biased;
-
-                _ = shutdown.cancelled() => {
-                    match config.shutdown_behaviour {
-                        ReduceShutdownBehaviour::Flush => {
-                            debug!("Received shutdown signal, flushing batch...");
-                            reducer
-                                .flush()
-                                .await
-                                .expect("error reducer flush should always be successful");
-                        },
-                        ReduceShutdownBehaviour::Drop => {
-                            debug!("Received shutdown signal, dropping batch...");
-                            drop(reducer);
-                        },
-                    }
                     break;
-                }
+                };
+                highwater_mark.track(&msg);
 
-                val = receiver.recv(), if !reducer.is_full() => {
-                    let Some(msg) = val else {
-                        debug!("Received end of stream, flushing batch...");
-                        reducer
-                            .flush()
-                            .await
-                            .expect("error reducer flush should always be successful");
-                        break;
-                    };
-                    highwater_mark.track(&msg);
-                    reducer
-                        .reduce(msg)
+                reducer
+                    .reduce(msg)
+                    .await
+                    .expect("error reducer reduce should always be successful");
+
+                if flush_timer.is_none() && !highwater_mark.is_empty() {
+                    ok.send(take(&mut highwater_mark).into())
                         .await
-                        .expect("error reducer reduce should always be successful");
-
-                    ok.send(take(&mut highwater_mark).into()).await?;
+                        .map_err(|err| anyhow!("{}", err))?;
                 }
             }
-        },
-    };
+        }
+    }
+
     debug!("Shutdown complete");
     Ok(())
 }
