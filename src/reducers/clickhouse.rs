@@ -2,7 +2,7 @@ use crate::{ReduceConfig, ReduceShutdownBehaviour, Reducer};
 use anyhow::{anyhow, Ok};
 use reqwest::Client;
 use serde::Serialize;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, mem::take, time::Duration};
 use tracing::info;
 
 pub struct ClickhouseWriter<T> {
@@ -56,7 +56,7 @@ where
         let res = self
             .http_client
             .post(self.url.clone())
-            .json(&self.buffer)
+            .json(&take(&mut self.buffer))
             .send()
             .await?;
 

@@ -538,7 +538,6 @@ async fn flush_reducer<T>(
                     .await
                     .map_err(|err| anyhow!("{}", err))?;
             }
-            reducer.reset();
         }
     }
     Ok(())
@@ -720,7 +719,6 @@ pub async fn reduce_err(
                         .flush()
                         .await
                         .expect("error reducer flush should always be successful");
-                    reducer.reset();
 
                     if !highwater_mark.is_empty() {
                         ok.send(take(&mut highwater_mark).into())
@@ -820,6 +818,7 @@ pub async fn commit(
 mod tests {
     use std::{
         collections::HashMap,
+        mem::take,
         sync::{Arc, RwLock},
         time::Duration,
     };
@@ -956,7 +955,7 @@ mod tests {
             self.pipe
                 .write()
                 .unwrap()
-                .extend(self.buffer.read().unwrap().clone().into_iter());
+                .extend(take(&mut self.buffer.write().unwrap() as &mut Vec<T>).into_iter());
             Ok(())
         }
 
