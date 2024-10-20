@@ -459,7 +459,7 @@ impl From<HighwaterMark> for TopicPartitionList {
 #[derive(Debug, Clone)]
 pub struct ReduceConfig {
     pub shutdown_behaviour: ReduceShutdownBehaviour,
-    pub flush_interval: Duration,
+    pub flush_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -497,6 +497,28 @@ async fn handle_reducer_failure<T>(
 }
 
 #[instrument(skip(reducer, batched_msg, highwater_mark, ok, err))]
+async fn shutdown_reducer<T>(
+    shutdown_behaviour: ReduceShutdownBehaviour,
+    mut reducer: impl Reducer<Item = T>,
+    batched_msg: &mut Vec<OwnedMessage>,
+    highwater_mark: &mut HighwaterMark,
+    ok: &mpsc::Sender<TopicPartitionList>,
+    err: &mpsc::Sender<OwnedMessage>,
+) -> Result<(), Error> {
+    match shutdown_behaviour {
+        ReduceShutdownBehaviour::Flush => {
+            debug!("Received shutdown signal, flushing reducer...");
+            flush_reducer(&mut reducer, batched_msg, highwater_mark, ok, err).await?;
+        }
+        ReduceShutdownBehaviour::Drop => {
+            debug!("Received shutdown signal, dropping reducer...");
+            drop(reducer);
+        }
+    };
+    Ok(())
+}
+
+#[instrument(skip(reducer, batched_msg, highwater_mark, ok, err))]
 async fn flush_reducer<T>(
     reducer: &mut impl Reducer<Item = T>,
     batched_msg: &mut Vec<OwnedMessage>,
@@ -530,20 +552,31 @@ pub async fn reduce<T>(
     err: mpsc::Sender<OwnedMessage>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
-    let config = reducer.get_reduce_config();
-    let mut interval = time::interval(config.flush_interval);
-
     let mut highwater_mark = HighwaterMark::new();
-    let mut batched_msg = Vec::new();
+    let config = reducer.get_reduce_config();
 
-    loop {
-        select! {
-            biased;
+    match config.flush_interval {
+        Some(interval) => {
+            let mut flush_timer = time::interval(interval);
+            let mut batched_msg = Vec::new();
 
-            _ = shutdown.cancelled() => {
-                match config.shutdown_behaviour {
-                    ReduceShutdownBehaviour::Flush => {
-                        debug!("Received shutdown signal, flushing batch...");
+            loop {
+                select! {
+                    biased;
+
+                    _ = shutdown.cancelled() => {
+                        shutdown_reducer(
+                            config.shutdown_behaviour,
+                            reducer,
+                            &mut batched_msg,
+                            &mut highwater_mark,
+                            &ok,
+                            &err
+                        ).await?;
+                        break;
+                    }
+
+                    _ = flush_timer.tick() => {
                         flush_reducer(
                             &mut reducer,
                             &mut batched_msg,
@@ -551,58 +584,99 @@ pub async fn reduce<T>(
                             &ok,
                             &err
                         ).await?;
-                    },
-                    ReduceShutdownBehaviour::Drop => {
-                        debug!("Received shutdown signal, dropping batch...");
-                        drop(reducer);
-                    },
-                }
-                break;
-            }
+                    }
 
-            _ = interval.tick() => {
-                flush_reducer(
-                    &mut reducer,
-                    &mut batched_msg,
-                    &mut highwater_mark,
-                    &ok,
-                    &err
-                ).await?;
-            }
+                    val = receiver.recv(), if !reducer.is_full() => {
+                        let Some((msg, value)) = val else {
+                            debug!("Received end of stream, flushing batch...");
+                            flush_reducer(
+                                &mut reducer,
+                                &mut batched_msg,
+                                &mut highwater_mark,
+                                &ok,
+                                &err
+                            ).await?;
+                            break;
+                        };
+                        highwater_mark.track(&msg);
+                        batched_msg.push(msg);
 
-            val = receiver.recv(), if !reducer.is_full() => {
-                let Some((msg, value)) = val else {
-                    debug!("Received end of stream, flushing batch...");
-                    flush_reducer(
-                        &mut reducer,
-                        &mut batched_msg,
-                        &mut highwater_mark,
-                        &ok,
-                        &err
-                    ).await?;
-                    break;
-                };
-                highwater_mark.track(&msg);
-                batched_msg.push(msg);
-
-                if let Err(e) = reducer.reduce(value).await {
-                    error!(
-                        "Failed to reduce message at (topic: {}, partition: {}, offset: {}), reason: {}",
-                        batched_msg.last().unwrap().topic(),
-                        batched_msg.last().unwrap().partition(),
-                        batched_msg.last().unwrap().offset(),
-                        e
-                    );
-                    handle_reducer_failure(
-                        &mut reducer,
-                        &mut batched_msg,
-                        &mut highwater_mark,
-                        &err
-                    ).await;
+                        if let Err(e) = reducer.reduce(value).await {
+                            error!(
+                                "Failed to reduce message at \
+                                (topic: {}, partition: {}, offset: {}), reason: {}",
+                                batched_msg.last().unwrap().topic(),
+                                batched_msg.last().unwrap().partition(),
+                                batched_msg.last().unwrap().offset(),
+                                e
+                            );
+                            handle_reducer_failure(
+                                &mut reducer,
+                                &mut batched_msg,
+                                &mut highwater_mark,
+                                &err
+                            ).await;
+                        }
+                    }
                 }
             }
         }
-    }
+        None => loop {
+            select! {
+                biased;
+
+                _ = shutdown.cancelled() => {
+                    match config.shutdown_behaviour {
+                        ReduceShutdownBehaviour::Flush => {
+                            debug!("Received shutdown signal, flushing reducer...");
+                            reducer.flush().await?;
+                        },
+                        ReduceShutdownBehaviour::Drop => {
+                            debug!("Received shutdown signal, dropping reducer...");
+                            drop(reducer);
+                        },
+                    }
+                    break;
+                }
+
+                val = receiver.recv(), if !reducer.is_full() => {
+                    let Some((msg, value)) = val else {
+                        debug!("Received end of stream, flushing reducer...");
+                        flush_reducer(
+                            &mut reducer,
+                            &mut vec![],
+                            &mut highwater_mark,
+                            &ok,
+                            &err
+                        ).await?;
+                        break;
+                    };
+
+                    highwater_mark.track(&msg);
+                    if let Err(e) = reducer.reduce(value).await {
+                        error!(
+                            "Failed to reduce message at \
+                            (topic: {}, partition: {}, offset: {}), reason: {}",
+                            msg.topic(),
+                            msg.partition(),
+                            msg.offset(),
+                            e
+                        );
+
+                        handle_reducer_failure(
+                            &mut reducer,
+                            &mut vec![msg],
+                            &mut highwater_mark,
+                            &err
+                        ).await;
+                    } else {
+                        ok.send(take(&mut highwater_mark).into()).await?;
+                    }
+                }
+            }
+        },
+    };
+
     debug!("Shutdown complete");
     Ok(())
 }
@@ -614,64 +688,106 @@ pub async fn reduce_err(
     ok: mpsc::Sender<TopicPartitionList>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
-    let config = reducer.get_reduce_config();
-    let mut interval = time::interval(config.flush_interval);
-
     let mut highwater_mark = HighwaterMark::new();
+    let config = reducer.get_reduce_config();
 
-    loop {
-        select! {
-            biased;
+    match config.flush_interval {
+        Some(interval) => loop {
+            let mut flush_timer = time::interval(interval);
 
-            _ = shutdown.cancelled() => {
-                match config.shutdown_behaviour {
-                    ReduceShutdownBehaviour::Flush => {
-                        debug!("Received shutdown signal, flushing batch...");
-                        reducer
-                            .flush()
-                            .await
-                            .expect("error reducer flush should always be successful");
-                    },
-                    ReduceShutdownBehaviour::Drop => {
-                        debug!("Received shutdown signal, dropping batch...");
-                        drop(reducer);
-                    },
+            select! {
+                biased;
+
+                _ = shutdown.cancelled() => {
+                    match config.shutdown_behaviour {
+                        ReduceShutdownBehaviour::Flush => {
+                            debug!("Received shutdown signal, flushing batch...");
+                            reducer
+                                .flush()
+                                .await
+                                .expect("error reducer flush should always be successful");
+                        },
+                        ReduceShutdownBehaviour::Drop => {
+                            debug!("Received shutdown signal, dropping batch...");
+                            drop(reducer);
+                        },
+                    }
+                    break;
                 }
-                break;
-            }
 
-            _ = interval.tick() => {
-                reducer
-                    .flush()
-                    .await
-                    .expect("error reducer flush should always be successful");
-                reducer.reset();
-
-                if !highwater_mark.is_empty() {
-                    ok.send(take(&mut highwater_mark).into())
-                        .await
-                        .map_err(|err| anyhow!("{}", err))?;
-                }
-            }
-
-            val = receiver.recv(), if !reducer.is_full() => {
-                let Some(msg) = val else {
-                    debug!("Received end of stream, flushing batch...");
+                _ = flush_timer.tick() => {
                     reducer
                         .flush()
                         .await
                         .expect("error reducer flush should always be successful");
-                    break;
-                };
-                highwater_mark.track(&msg);
+                    reducer.reset();
 
-                reducer
-                    .reduce(msg)
-                    .await
-                    .expect("error reducer reduce should always be successful");
+                    if !highwater_mark.is_empty() {
+                        ok.send(take(&mut highwater_mark).into())
+                            .await
+                            .map_err(|err| anyhow!("{}", err))?;
+                    }
+                }
+
+                val = receiver.recv(), if !reducer.is_full() => {
+                    let Some(msg) = val else {
+                        debug!("Received end of stream, flushing batch...");
+                        reducer
+                            .flush()
+                            .await
+                            .expect("error reducer flush should always be successful");
+                        break;
+                    };
+                    highwater_mark.track(&msg);
+
+                    reducer
+                        .reduce(msg)
+                        .await
+                        .expect("error reducer reduce should always be successful");
+                }
             }
-        }
-    }
+        },
+        None => loop {
+            select! {
+                biased;
+
+                _ = shutdown.cancelled() => {
+                    match config.shutdown_behaviour {
+                        ReduceShutdownBehaviour::Flush => {
+                            debug!("Received shutdown signal, flushing batch...");
+                            reducer
+                                .flush()
+                                .await
+                                .expect("error reducer flush should always be successful");
+                        },
+                        ReduceShutdownBehaviour::Drop => {
+                            debug!("Received shutdown signal, dropping batch...");
+                            drop(reducer);
+                        },
+                    }
+                    break;
+                }
+
+                val = receiver.recv(), if !reducer.is_full() => {
+                    let Some(msg) = val else {
+                        debug!("Received end of stream, flushing batch...");
+                        reducer
+                            .flush()
+                            .await
+                            .expect("error reducer flush should always be successful");
+                        break;
+                    };
+                    highwater_mark.track(&msg);
+                    reducer
+                        .reduce(msg)
+                        .await
+                        .expect("error reducer reduce should always be successful");
+
+                    ok.send(take(&mut highwater_mark).into()).await?;
+                }
+            }
+        },
+    };
     debug!("Shutdown complete");
     Ok(())
 }
@@ -704,10 +820,7 @@ pub async fn commit(
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{
-            atomic::{AtomicU8, Ordering},
-            Arc, RwLock,
-        },
+        sync::{Arc, RwLock},
         time::Duration,
     };
 
@@ -715,10 +828,7 @@ mod tests {
     use rdkafka::{
         error::KafkaResult, message::OwnedMessage, Message, Offset, Timestamp, TopicPartitionList,
     };
-    use tokio::{
-        sync::{mpsc, oneshot},
-        time::sleep,
-    };
+    use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
     use crate::{
@@ -736,16 +846,73 @@ mod tests {
         }
     }
 
-    struct MockReducer<T> {
-        buffer: Arc<RwLock<Vec<T>>>,
-        pipe: Arc<RwLock<Vec<T>>>,
+    struct StreamingReducer<T> {
+        output: Arc<RwLock<Vec<T>>>,
+        error_on_idx: Option<usize>,
     }
 
-    impl<T> MockReducer<T> {
-        fn new() -> Self {
+    impl<T> StreamingReducer<T> {
+        fn new(error_on_idx: Option<usize>) -> Self {
+            Self {
+                output: Arc::new(RwLock::new(Vec::new())),
+                error_on_idx,
+            }
+        }
+
+        fn get_output(&self) -> Arc<RwLock<Vec<T>>> {
+            self.output.clone()
+        }
+    }
+
+    impl<T> Reducer for StreamingReducer<T>
+    where
+        T: Send + Sync + Clone,
+    {
+        type Item = T;
+
+        async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+            if let Some(idx) = self.error_on_idx {
+                if idx == self.output.read().unwrap().len() {
+                    self.error_on_idx.take();
+                    return Err(anyhow!("err"));
+                }
+            }
+            self.output.write().unwrap().push(t);
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        fn reset(&mut self) {}
+
+        fn is_full(&self) -> bool {
+            false
+        }
+
+        fn get_reduce_config(&self) -> ReduceConfig {
+            ReduceConfig {
+                shutdown_behaviour: ReduceShutdownBehaviour::Drop,
+                flush_interval: None,
+            }
+        }
+    }
+
+    struct BatchingReducer<T> {
+        buffer: Arc<RwLock<Vec<T>>>,
+        pipe: Arc<RwLock<Vec<T>>>,
+        error_on_nth_reduce: Option<usize>,
+        error_on_nth_flush: Option<usize>,
+    }
+
+    impl<T> BatchingReducer<T> {
+        fn new(error_on_reduce: Option<usize>, error_on_flush: Option<usize>) -> Self {
             Self {
                 buffer: Arc::new(RwLock::new(Vec::new())),
                 pipe: Arc::new(RwLock::new(Vec::new())),
+                error_on_nth_reduce: error_on_reduce,
+                error_on_nth_flush: error_on_flush,
             }
         }
 
@@ -758,18 +925,34 @@ mod tests {
         }
     }
 
-    impl<T> Reducer for MockReducer<T>
+    impl<T> Reducer for BatchingReducer<T>
     where
         T: Send + Sync + Clone,
     {
         type Item = T;
 
         async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+            if let Some(idx) = self.error_on_nth_reduce {
+                if idx == 0 {
+                    self.error_on_nth_reduce.take();
+                    return Err(anyhow!("err"));
+                } else {
+                    self.error_on_nth_reduce = Some(idx - 1);
+                }
+            }
             self.buffer.write().unwrap().push(t);
             Ok(())
         }
 
         async fn flush(&mut self) -> Result<(), anyhow::Error> {
+            if let Some(idx) = self.error_on_nth_flush {
+                if idx == 0 {
+                    self.error_on_nth_flush.take();
+                    return Err(anyhow!("err"));
+                } else {
+                    self.error_on_nth_flush = Some(idx - 1);
+                }
+            }
             self.pipe
                 .write()
                 .unwrap()
@@ -788,76 +971,7 @@ mod tests {
         fn get_reduce_config(&self) -> crate::ReduceConfig {
             ReduceConfig {
                 shutdown_behaviour: ReduceShutdownBehaviour::Flush,
-                flush_interval: Duration::from_secs(1),
-            }
-        }
-    }
-
-    enum ReducerFailure {
-        FailOnReduce,
-        FailOnFlush,
-    }
-    struct MockAlwaysErrReducer {
-        failure: ReducerFailure,
-        num_reduce: Arc<AtomicU8>,
-        num_flush: Arc<AtomicU8>,
-        num_reset: Arc<AtomicU8>,
-    }
-
-    impl MockAlwaysErrReducer {
-        fn new(failure: ReducerFailure) -> Self {
-            Self {
-                failure,
-                num_reduce: Arc::new(AtomicU8::new(0)),
-                num_flush: Arc::new(AtomicU8::new(0)),
-                num_reset: Arc::new(AtomicU8::new(0)),
-            }
-        }
-
-        fn get_num_reduce(&self) -> Arc<AtomicU8> {
-            self.num_reduce.clone()
-        }
-
-        fn get_num_flush(&self) -> Arc<AtomicU8> {
-            self.num_flush.clone()
-        }
-
-        fn get_num_reset(&self) -> Arc<AtomicU8> {
-            self.num_reset.clone()
-        }
-    }
-
-    impl Reducer for MockAlwaysErrReducer {
-        type Item = ();
-
-        async fn reduce(&mut self, _: Self::Item) -> Result<(), anyhow::Error> {
-            self.num_reduce.fetch_add(1, Ordering::Relaxed);
-            match self.failure {
-                ReducerFailure::FailOnReduce => Err(anyhow!("Oops")),
-                ReducerFailure::FailOnFlush => Ok(()),
-            }
-        }
-
-        async fn flush(&mut self) -> Result<(), anyhow::Error> {
-            self.num_flush.fetch_add(1, Ordering::Relaxed);
-            match self.failure {
-                ReducerFailure::FailOnReduce => Ok(()),
-                ReducerFailure::FailOnFlush => Err(anyhow!("Oops")),
-            }
-        }
-
-        fn reset(&mut self) {
-            self.num_reset.fetch_add(1, Ordering::Relaxed);
-        }
-
-        fn is_full(&self) -> bool {
-            false
-        }
-
-        fn get_reduce_config(&self) -> ReduceConfig {
-            ReduceConfig {
-                shutdown_behaviour: ReduceShutdownBehaviour::Flush,
-                flush_interval: Duration::from_secs(1),
+                flush_interval: Some(Duration::from_secs(1)),
             }
         }
     }
@@ -890,8 +1004,175 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reduce_err() {
-        let reducer = MockReducer::new();
+    async fn test_reduce_err_without_flush_interval() {
+        let reducer = StreamingReducer::new(None);
+        let output = reducer.get_output();
+
+        let (sender, receiver) = mpsc::channel(1);
+        let (commit_sender, mut commit_receiver) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+
+        let msg = OwnedMessage::new(
+            Some(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            0,
+            None,
+        );
+
+        tokio::spawn(reduce_err(
+            reducer,
+            receiver,
+            commit_sender,
+            shutdown.clone(),
+        ));
+
+        assert!(sender.send(msg.clone()).await.is_ok());
+        assert_eq!(
+            commit_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(1)
+            )]))
+            .unwrap()
+        );
+        assert_eq!(
+            output.read().unwrap().last().unwrap().payload().unwrap(),
+            &[0, 1, 2, 3, 4, 5, 6, 7]
+        );
+
+        drop(sender);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_reduce_without_flush_interval() {
+        let reducer = StreamingReducer::new(None);
+        let output = reducer.get_output();
+
+        let (sender, receiver) = mpsc::channel(2);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(2);
+        let (err_sender, err_receiver) = mpsc::channel(2);
+        let shutdown = CancellationToken::new();
+
+        let msg_0 = OwnedMessage::new(
+            Some(vec![0, 2, 4, 6]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            0,
+            None,
+        );
+        let msg_1 = OwnedMessage::new(
+            Some(vec![1, 3, 5, 7]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            1,
+            None,
+        );
+
+        tokio::spawn(reduce(
+            reducer,
+            receiver,
+            ok_sender,
+            err_sender,
+            shutdown.clone(),
+        ));
+
+        assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
+        assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
+
+        assert_eq!(
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(1)
+            )]))
+            .unwrap()
+        );
+        assert_eq!(
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(2)
+            )]))
+            .unwrap()
+        );
+        assert_eq!(output.read().unwrap().as_slice(), &[1, 2]);
+        assert!(err_receiver.is_empty());
+
+        drop(sender);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_fail_on_reduce_without_flush_interval() {
+        let reducer = StreamingReducer::new(Some(1));
+        let output = reducer.get_output();
+
+        let (sender, receiver) = mpsc::channel(2);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(2);
+        let (err_sender, mut err_receiver) = mpsc::channel(2);
+        let shutdown = CancellationToken::new();
+
+        let msg_0 = OwnedMessage::new(
+            Some(vec![0, 2, 4, 6]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            0,
+            None,
+        );
+        let msg_1 = OwnedMessage::new(
+            Some(vec![1, 3, 5, 7]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            1,
+            None,
+        );
+
+        tokio::spawn(reduce(
+            reducer,
+            receiver,
+            ok_sender,
+            err_sender,
+            shutdown.clone(),
+        ));
+
+        assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
+        assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
+
+        assert_eq!(
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(1)
+            )]))
+            .unwrap()
+        );
+        assert_eq!(
+            err_receiver.recv().await.unwrap().payload(),
+            msg_1.payload()
+        );
+        assert!(ok_receiver.is_empty());
+        assert!(err_receiver.is_empty());
+        assert_eq!(output.read().unwrap().as_slice(), &[1]);
+
+        drop(sender);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_reduce_err_with_flush_interval() {
+        let reducer = BatchingReducer::new(None, None);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -935,8 +1216,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reduce() {
-        let reducer = MockReducer::new();
+    async fn test_reduce_with_flush_interval() {
+        let reducer = BatchingReducer::new(None, None);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -975,10 +1256,6 @@ mod tests {
         assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
         assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
 
-        sleep(Duration::from_secs(2)).await;
-
-        assert!(buffer.read().unwrap().is_empty());
-        assert_eq!(pipe.read().unwrap().as_slice(), &[1, 2]);
         assert_eq!(
             ok_receiver.recv().await.unwrap(),
             TopicPartitionList::from_topic_map(&HashMap::from([(
@@ -987,6 +1264,8 @@ mod tests {
             )]))
             .unwrap()
         );
+        assert!(buffer.read().unwrap().is_empty());
+        assert_eq!(pipe.read().unwrap().as_slice(), &[1, 2]);
         assert!(err_receiver.is_empty());
 
         drop(sender);
@@ -994,61 +1273,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fail_on_reduce() {
-        let reducer = MockAlwaysErrReducer::new(ReducerFailure::FailOnReduce);
-        let num_reduce = reducer.get_num_reduce();
-        let num_flush = reducer.get_num_flush();
-        let num_reset = reducer.get_num_reset();
+    async fn test_fail_on_reduce_with_flush_interval() {
+        let reducer = BatchingReducer::new(Some(1), None);
 
         let (sender, receiver) = mpsc::channel(1);
-        let (ok_sender, ok_receiver) = mpsc::channel(1);
-        let (err_sender, mut err_receiver) = mpsc::channel(1);
-        let shutdown = CancellationToken::new();
-
-        let msg = OwnedMessage::new(
-            Some(vec![0, 1, 2, 3, 4, 5, 6, 7]),
-            None,
-            "topic".to_string(),
-            Timestamp::now(),
-            0,
-            0,
-            None,
-        );
-
-        tokio::spawn(reduce(
-            reducer,
-            receiver,
-            ok_sender,
-            err_sender,
-            shutdown.clone(),
-        ));
-
-        assert!(sender.send((msg.clone(), ())).await.is_ok());
-        assert_eq!(err_receiver.recv().await.unwrap().payload(), msg.payload());
-
-        drop(sender);
-        shutdown.cancel();
-
-        assert!(ok_receiver.is_empty());
-        assert_eq!(num_reduce.load(Ordering::Relaxed), 1);
-        assert_eq!(num_flush.load(Ordering::Relaxed), 0);
-        assert_eq!(num_reset.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn test_fail_on_flush() {
-        let reducer = MockAlwaysErrReducer::new(ReducerFailure::FailOnFlush);
-        let num_reduce = reducer.get_num_reduce();
-        let num_flush = reducer.get_num_flush();
-        let num_reset = reducer.get_num_reset();
-
-        let (sender, receiver) = mpsc::channel(1);
-        let (ok_sender, ok_receiver) = mpsc::channel(1);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(1);
         let (err_sender, mut err_receiver) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
 
         let msg_0 = OwnedMessage::new(
-            Some(vec![0, 2, 4, 6]),
+            Some(vec![0, 3, 6]),
             None,
             "topic".to_string(),
             Timestamp::now(),
@@ -1057,12 +1291,21 @@ mod tests {
             None,
         );
         let msg_1 = OwnedMessage::new(
-            Some(vec![1, 3, 5, 7]),
+            Some(vec![1, 4, 7]),
             None,
             "topic".to_string(),
             Timestamp::now(),
             0,
             1,
+            None,
+        );
+        let msg_2 = OwnedMessage::new(
+            Some(vec![2, 5, 8]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            2,
             None,
         );
 
@@ -1075,21 +1318,127 @@ mod tests {
         ));
 
         assert!(sender.send((msg_0.clone(), ())).await.is_ok());
-        assert!(sender.send((msg_1.clone(), ())).await.is_ok());
 
         assert_eq!(
-            err_receiver.recv().await.unwrap().payload(),
-            msg_0.payload()
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(1)
+            )]))
+            .unwrap()
         );
+
+        assert!(sender.send((msg_1.clone(), ())).await.is_ok());
         assert_eq!(
             err_receiver.recv().await.unwrap().payload(),
             msg_1.payload()
         );
-        assert!(ok_receiver.is_empty());
 
-        assert_eq!(num_reduce.load(Ordering::Relaxed), 2);
-        assert_eq!(num_flush.load(Ordering::Relaxed), 1);
-        assert_eq!(num_reset.load(Ordering::Relaxed), 1);
+        assert!(sender.send((msg_2.clone(), ())).await.is_ok());
+
+        assert_eq!(
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(3)
+            )]))
+            .unwrap()
+        );
+
+        drop(sender);
+        shutdown.cancel();
+
+        assert!(ok_receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fail_on_flush() {
+        let reducer = BatchingReducer::new(None, Some(1));
+
+        let (sender, receiver) = mpsc::channel(1);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(1);
+        let (err_sender, mut err_receiver) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+
+        let msg_0 = OwnedMessage::new(
+            Some(vec![0, 3, 6]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            0,
+            None,
+        );
+        let msg_1 = OwnedMessage::new(
+            Some(vec![1, 4, 7]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            1,
+            None,
+        );
+        let msg_2 = OwnedMessage::new(
+            Some(vec![2, 5, 8]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            2,
+            None,
+        );
+        let msg_3 = OwnedMessage::new(
+            Some(vec![0, 0, 0]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            3,
+            None,
+        );
+
+        tokio::spawn(reduce(
+            reducer,
+            receiver,
+            ok_sender,
+            err_sender,
+            shutdown.clone(),
+        ));
+
+        assert!(sender.send((msg_0.clone(), ())).await.is_ok());
+
+        assert_eq!(
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(1)
+            )]))
+            .unwrap()
+        );
+
+        assert!(sender.send((msg_1.clone(), ())).await.is_ok());
+        assert!(sender.send((msg_2.clone(), ())).await.is_ok());
+        assert_eq!(
+            err_receiver.recv().await.unwrap().payload(),
+            msg_1.payload()
+        );
+        assert_eq!(
+            err_receiver.recv().await.unwrap().payload(),
+            msg_2.payload()
+        );
+
+        assert!(sender.send((msg_3, ())).await.is_ok());
+        assert_eq!(
+            ok_receiver.recv().await.unwrap(),
+            TopicPartitionList::from_topic_map(&HashMap::from([(
+                ("topic".to_string(), 0),
+                Offset::Offset(4)
+            )]))
+            .unwrap()
+        );
+
+        assert!(ok_receiver.is_empty());
+        assert!(err_receiver.is_empty());
 
         drop(sender);
         shutdown.cancel();

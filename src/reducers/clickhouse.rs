@@ -32,7 +32,7 @@ impl<T> ClickhouseWriter<T> {
             ),
             reduce_config: ReduceConfig {
                 shutdown_behaviour,
-                flush_interval,
+                flush_interval: Some(flush_interval),
             },
         }
     }

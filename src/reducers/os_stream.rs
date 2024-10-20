@@ -51,7 +51,7 @@ where
     fn get_reduce_config(&self) -> ReduceConfig {
         ReduceConfig {
             shutdown_behaviour: ReduceShutdownBehaviour::Flush,
-            flush_interval: self.print_duration,
+            flush_interval: None,
         }
     }
 }
