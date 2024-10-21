@@ -182,10 +182,10 @@ macro_rules! processing_strategy {
             let reducer = $reduce;
             let err_reducer = $reduce_err;
 
-            const MAX_CHANNEL_BUF_SIZE: usize = 1048576;
-            let (reduce_sender, reduce_receiver) = tokio::sync::mpsc::channel(MAX_CHANNEL_BUF_SIZE);
-            let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(MAX_CHANNEL_BUF_SIZE);
-            let (err_sender, err_receiver) = tokio::sync::mpsc::channel(MAX_CHANNEL_BUF_SIZE);
+            const CHANNEL_BUFF_SIZE: usize = 64;
+            let (reduce_sender, reduce_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+            let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+            let (err_sender, err_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
 
             for (topic, partition) in tpl.iter() {
                 let queue = consumer
