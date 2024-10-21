@@ -401,7 +401,8 @@ where
                     }
                     Err(e) => {
                         error!(
-                            "Failed to map message at (topic: {}, partition: {}, offset: {}), reason: {}",
+                            "Failed to map message at \
+                            (topic: {}, partition: {}, offset: {}), reason: {}",
                             msg.topic(),
                             msg.partition(),
                             msg.offset(),
@@ -562,9 +563,7 @@ pub async fn reduce<T>(
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
     let mut highwater_mark = HighwaterMark::new();
-    let mut flush_timer = config
-        .flush_interval
-        .map(|duration| time::interval(duration));
+    let mut flush_timer = config.flush_interval.map(time::interval);
     let mut inflight_msgs = Vec::new();
 
     loop {
@@ -655,9 +654,7 @@ pub async fn reduce_err(
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
     let mut highwater_mark = HighwaterMark::new();
-    let mut flush_timer = config
-        .flush_interval
-        .map(|duration| time::interval(duration));
+    let mut flush_timer = config.flush_interval.map(time::interval);
 
     loop {
         select! {
