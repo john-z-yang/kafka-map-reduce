@@ -9,7 +9,7 @@ edition = "2021"
 rdkafka = { version = "0.36.2", features = ["cmake-build"] }
 tokio = { version = "1.40.0", features = ["full"] }
 tokio-util = "0.7.12"
-tokio-stream = "0.1.16"
+tokio-stream = { version = "0.1.16", features = ["full"] }
 async-stream = "0.3.5"
 futures = "0.3.28"
 chrono = { version = "0.4.26", features = ["serde"] }

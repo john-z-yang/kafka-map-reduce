@@ -338,21 +338,27 @@ pub async fn handle_events(
 }
 
 trait KafkaMessage {
-    fn detach(&self) -> OwnedMessage;
+    fn detach(&self) -> Result<OwnedMessage, Error>;
 }
 
-impl KafkaMessage for BorrowedMessage<'_> {
-    fn detach(&self) -> OwnedMessage {
-        self.detach()
+impl KafkaMessage for Result<BorrowedMessage<'_>, KafkaError> {
+    fn detach(&self) -> Result<OwnedMessage, Error> {
+        match self {
+            Ok(borrowed_msg) => Ok(borrowed_msg.detach()),
+            Err(err) => Err(anyhow!(
+                "Cannot detach message, got error from kafka: {:?}",
+                err
+            )),
+        }
     }
 }
 
 trait MessageQueue {
-    fn stream(&self) -> impl Stream<Item = Result<impl KafkaMessage, KafkaError>>;
+    fn stream(&self) -> impl Stream<Item = impl KafkaMessage>;
 }
 
 impl MessageQueue for StreamPartitionQueue<KafkaContext> {
-    fn stream(&self) -> impl Stream<Item = Result<impl KafkaMessage, KafkaError>> {
+    fn stream(&self) -> impl Stream<Item = impl KafkaMessage> {
         self.stream()
     }
 }
@@ -380,10 +386,10 @@ where
             }
 
             val = stream.next() => {
-                let Some(Ok(msg)) = val else {
+                let Some(msg) = val else {
                     break;
                 };
-                let msg = Arc::new(msg.detach());
+                let msg = Arc::new(msg.detach()?);
                 match transform(msg.clone()).await {
                     Ok(transformed) => {
                         ok.send((
@@ -753,18 +759,23 @@ mod tests {
         time::Duration,
     };
 
-    use anyhow::anyhow;
+    use anyhow::{anyhow, Error};
+    use futures::Stream;
     use rdkafka::{
-        error::KafkaResult, message::OwnedMessage, Message, Offset, Timestamp, TopicPartitionList,
+        error::{KafkaError, KafkaResult},
+        message::OwnedMessage,
+        Message, Offset, Timestamp, TopicPartitionList,
     };
     use tokio::{
-        sync::{mpsc, oneshot},
+        sync::{broadcast, mpsc, oneshot},
         time::sleep,
     };
+    use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        commit, reduce, reduce_err, CommitClient, ReduceConfig, ReduceShutdownBehaviour, Reducer,
+        commit, map, reduce, reduce_err, CommitClient, KafkaMessage, MessageQueue, ReduceConfig,
+        ReduceShutdownBehaviour, Reducer,
     };
 
     struct MockCommitClient {
@@ -1429,5 +1440,144 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         assert!(ok_receiver.is_empty());
         assert!(err_receiver.is_empty());
+    }
+
+    #[derive(Clone)]
+    struct MockMessage {
+        payload: Vec<u8>,
+        topic: String,
+        partition: i32,
+        offset: i64,
+    }
+
+    impl KafkaMessage for Result<Result<MockMessage, KafkaError>, BroadcastStreamRecvError> {
+        fn detach(&self) -> Result<OwnedMessage, Error> {
+            let clone = self.clone().unwrap().unwrap();
+            Ok(OwnedMessage::new(
+                Some(clone.payload),
+                None,
+                clone.topic,
+                Timestamp::now(),
+                clone.partition,
+                clone.offset,
+                None,
+            ))
+        }
+    }
+
+    impl MessageQueue for broadcast::Receiver<Result<MockMessage, KafkaError>> {
+        fn stream(&self) -> impl Stream<Item = impl KafkaMessage> {
+            BroadcastStream::new(self.resubscribe())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_map() {
+        let (sender, receiver) = broadcast::channel(1);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(1);
+        let (err_sender, err_receiver) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+
+        tokio::spawn(map(
+            receiver,
+            |msg| async move { Ok(msg.payload().unwrap()[0] * 2) },
+            ok_sender,
+            err_sender,
+            shutdown.clone(),
+        ));
+        sleep(Duration::from_secs(1)).await;
+
+        let msg_0 = MockMessage {
+            payload: vec![0],
+            topic: "topic".to_string(),
+            partition: 0,
+            offset: 0,
+        };
+        let msg_1 = MockMessage {
+            payload: vec![1],
+            topic: "topic".to_string(),
+            partition: 0,
+            offset: 1,
+        };
+        assert!(sender.send(Ok(msg_0.clone())).is_ok());
+        assert!(err_receiver.is_empty());
+        let res = ok_receiver.recv().await.unwrap();
+        assert_eq!(res.0.payload(), Some(msg_0.payload.clone()).as_deref());
+        assert_eq!(res.1, msg_0.payload[0] * 2);
+
+        assert!(sender.send(Ok(msg_1.clone())).is_ok());
+        assert!(err_receiver.is_empty());
+        let res = ok_receiver.recv().await.unwrap();
+        assert_eq!(res.0.payload(), Some(msg_1.payload.clone()).as_deref());
+        assert_eq!(res.1, msg_1.payload[0] * 2);
+
+        shutdown.cancel();
+        sleep(Duration::from_secs(1)).await;
+        assert!(ok_receiver.is_closed());
+        assert!(err_receiver.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_fail_on_map() {
+        let (sender, receiver) = broadcast::channel(1);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(1);
+        let (err_sender, mut err_receiver) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+
+        tokio::spawn(map(
+            receiver,
+            |msg| async move {
+                if msg.payload().unwrap()[0] == 1 {
+                    Err(anyhow!("Oh no"))
+                } else {
+                    Ok(msg.payload().unwrap()[0] * 2)
+                }
+            },
+            ok_sender,
+            err_sender,
+            shutdown.clone(),
+        ));
+        sleep(Duration::from_secs(1)).await;
+
+        let msg_0 = MockMessage {
+            payload: vec![0],
+            topic: "topic".to_string(),
+            partition: 0,
+            offset: 0,
+        };
+        let msg_1 = MockMessage {
+            payload: vec![1],
+            topic: "topic".to_string(),
+            partition: 0,
+            offset: 1,
+        };
+        let msg_2 = MockMessage {
+            payload: vec![2],
+            topic: "topic".to_string(),
+            partition: 0,
+            offset: 2,
+        };
+
+        assert!(sender.send(Ok(msg_0.clone())).is_ok());
+        assert!(err_receiver.is_empty());
+        let res = ok_receiver.recv().await.unwrap();
+        assert_eq!(res.0.payload(), Some(msg_0.payload).as_deref());
+        assert_eq!(res.1, 0);
+
+        assert!(sender.send(Ok(msg_1.clone())).is_ok());
+        assert!(ok_receiver.is_empty());
+        let res = err_receiver.recv().await.unwrap();
+        assert_eq!(res.payload(), Some(msg_1.payload).as_deref());
+
+        assert!(sender.send(Ok(msg_2.clone())).is_ok());
+        assert!(err_receiver.is_empty());
+        let res = ok_receiver.recv().await.unwrap();
+        assert_eq!(res.0.payload(), Some(msg_2.payload).as_deref());
+        assert_eq!(res.1, 4);
+
+        shutdown.cancel();
+        sleep(Duration::from_secs(1)).await;
+        assert!(ok_receiver.is_closed());
+        assert!(err_receiver.is_closed());
     }
 }
