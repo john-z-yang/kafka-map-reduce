@@ -577,7 +577,7 @@ pub async fn reduce<T>(
                     &mut inflight_msgs,
                     &mut highwater_mark,
                     &ok,
-                    &err
+                    &err,
                 ).await?;
                 break;
             }
@@ -592,7 +592,7 @@ pub async fn reduce<T>(
                     &mut inflight_msgs,
                     &mut highwater_mark,
                     &ok,
-                    &err
+                    &err,
                 ).await?;
             }
 
@@ -604,7 +604,7 @@ pub async fn reduce<T>(
                         &mut inflight_msgs,
                         &mut highwater_mark,
                         &ok,
-                        &err
+                        &err,
                     ).await?;
                     break;
                 };
@@ -619,13 +619,13 @@ pub async fn reduce<T>(
                         inflight_msgs.last().unwrap().topic(),
                         inflight_msgs.last().unwrap().partition(),
                         inflight_msgs.last().unwrap().offset(),
-                        e
+                        e,
                     );
                     handle_reducer_failure(
                         &mut reducer,
                         &mut inflight_msgs,
                         &mut highwater_mark,
-                        &err
+                        &err,
                     ).await;
                 }
 
