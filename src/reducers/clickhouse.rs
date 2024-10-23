@@ -4,7 +4,7 @@ use reqwest::Client;
 use std::{collections::HashMap, mem::replace, time::Duration};
 use tracing::info;
 
-pub struct ClickhouseWriter {
+pub struct ClickhouseBatchWriter {
     buffer: Vec<u8>,
     http_client: Client,
     max_buf_size: usize,
@@ -12,7 +12,7 @@ pub struct ClickhouseWriter {
     reduce_config: ReduceConfig,
 }
 
-impl ClickhouseWriter {
+impl ClickhouseBatchWriter {
     pub fn new(
         host: &str,
         port: &str,
@@ -37,7 +37,7 @@ impl ClickhouseWriter {
     }
 }
 
-impl Reducer for ClickhouseWriter {
+impl Reducer for ClickhouseBatchWriter {
     type Item = Vec<u8>;
 
     async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {

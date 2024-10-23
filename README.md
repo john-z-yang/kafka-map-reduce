@@ -32,11 +32,11 @@ async fn main() -> Result<(), Error> {
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
             map => parse,
-            reduce => ClickhouseWriter::new(
+            reduce => ClickhouseBatchWriter::new(
                 host,
                 port,
                 table,
-                64,
+                32_768,
                 Duration::from_secs(4),
                 ReduceShutdownBehaviour::Flush,
             ),

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Error};
 use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
-use kafka_map_reduce::reducers::clickhouse::ClickhouseWriter;
+use kafka_map_reduce::reducers::clickhouse::ClickhouseBatchWriter;
 use kafka_map_reduce::reducers::os_stream::{OsStream, OsStreamWriter};
 use kafka_map_reduce::{processing_strategy, start_consumer, ReduceShutdownBehaviour};
 use rdkafka::{config::RDKafkaLogLevel, message::OwnedMessage, ClientConfig, Message};
@@ -102,7 +102,7 @@ async fn main() -> Result<(), Error> {
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
             map => parse,
-            reduce => ClickhouseWriter::new(
+            reduce => ClickhouseBatchWriter::new(
                 host,
                 port,
                 table,
