@@ -18,12 +18,15 @@ struct Data {
     timestamp: DateTime<Utc>,
 }
 
-async fn parse(msg: Arc<OwnedMessage>) -> Result<Data, Error> {
+async fn parse(msg: Arc<OwnedMessage>) -> Result<Vec<u8>, Error> {
     match msg.payload_view::<str>() {
-        Some(res) => Ok(res.map(|_| Data {
-            partition: msg.partition() as u32,
-            offset: msg.offset() as u64,
-            timestamp: Utc::now(),
+        Some(res) => Ok(res.map(|_| {
+            serde_json::to_vec(&Data {
+                partition: msg.partition() as u32,
+                offset: msg.offset() as u64,
+                timestamp: Utc::now(),
+            })
+            .unwrap()
         })?),
         None => Err(anyhow!("Message has no data")),
     }
@@ -103,7 +106,7 @@ async fn main() -> Result<(), Error> {
                 host,
                 port,
                 table,
-                64,
+                32_768,
                 Duration::from_secs(4),
                 ReduceShutdownBehaviour::Flush,
             ),

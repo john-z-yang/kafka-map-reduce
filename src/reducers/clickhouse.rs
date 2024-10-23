@@ -1,19 +1,18 @@
 use crate::{ReduceConfig, ReduceShutdownBehaviour, Reducer};
 use anyhow::{anyhow, Ok};
 use reqwest::Client;
-use serde::Serialize;
-use std::{collections::HashMap, mem::take, time::Duration};
+use std::{collections::HashMap, mem::replace, time::Duration};
 use tracing::info;
 
-pub struct ClickhouseWriter<T> {
-    buffer: Vec<T>,
+pub struct ClickhouseWriter {
+    buffer: Vec<u8>,
     http_client: Client,
     max_buf_size: usize,
     url: String,
     reduce_config: ReduceConfig,
 }
 
-impl<T> ClickhouseWriter<T> {
+impl ClickhouseWriter {
     pub fn new(
         host: &str,
         port: &str,
@@ -38,14 +37,11 @@ impl<T> ClickhouseWriter<T> {
     }
 }
 
-impl<T> Reducer for ClickhouseWriter<T>
-where
-    T: Serialize + Send,
-{
-    type Item = T;
+impl Reducer for ClickhouseWriter {
+    type Item = Vec<u8>;
 
     async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
-        self.buffer.push(t);
+        self.buffer.extend(&t);
         Ok(())
     }
 
@@ -56,7 +52,10 @@ where
         let res = self
             .http_client
             .post(self.url.clone())
-            .json(&take(&mut self.buffer))
+            .body(replace(
+                &mut self.buffer,
+                Vec::with_capacity(self.max_buf_size),
+            ))
             .send()
             .await?;
 
@@ -68,8 +67,9 @@ where
                     .and_then(|val| val.to_str().ok())
                     .and_then(|s| serde_json::from_str::<HashMap<String, String>>(s).ok())
                     .and_then(|map| map.get("written_rows").cloned())
-                    .and_then(|s| s.parse::<u32>().ok()),
-                res.headers().get("x-clickhouse-query-id"),
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap(),
+                res.headers().get("x-clickhouse-query-id").unwrap(),
             );
             Ok(())
         } else {
