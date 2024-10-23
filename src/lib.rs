@@ -228,7 +228,7 @@ macro_rules! processing_strategy {
 }
 
 #[derive(Debug)]
-enum ActorState {
+enum ConsumerState {
     Ready,
     Consuming(ActorHandles),
     Stopped,
@@ -246,29 +246,29 @@ pub async fn handle_events(
     let mut shutdown_client = Some(shutdown_client);
     let mut events_stream = UnboundedReceiverStream::new(events);
 
-    let mut state = ActorState::Ready;
+    let mut state = ConsumerState::Ready;
 
-    while let ActorState::Ready { .. } | ActorState::Consuming { .. } = state {
+    while let ConsumerState::Ready { .. } | ConsumerState::Consuming { .. } = state {
         state = select! {
             biased;
             Some((event, _rendezvous_guard)) = &mut events_stream.next() => {
                 info!("Recieved event: {:?}", event);
                 match (state, event) {
-                    (ActorState::Ready, Event::Assign(tpl)) => {
+                    (ConsumerState::Ready, Event::Assign(tpl)) => {
                         let handles = spawn_actors(consumer.clone(), &tpl);
 
-                        ActorState::Consuming(handles)
+                        ConsumerState::Consuming(handles)
                     }
-                    (ActorState::Ready, Event::Revoke(_)) => {
+                    (ConsumerState::Ready, Event::Revoke(_)) => {
                         unreachable!("Got partition revocation before the consumer has started")
                     },
-                    (ActorState::Ready, Event::Shutdown) => {
-                        ActorState::Stopped
+                    (ConsumerState::Ready, Event::Shutdown) => {
+                        ConsumerState::Stopped
                     },
-                    (ActorState::Consuming { .. }, Event::Assign(_)) => {
+                    (ConsumerState::Consuming { .. }, Event::Assign(_)) => {
                         unreachable!("Got partition assignment after consumer has started")
                     },
-                    (ActorState::Consuming((_, shutdown_actors, mut rendezvous)),
+                    (ConsumerState::Consuming((_, shutdown_actors, mut rendezvous)),
                         Event::Revoke(_),
                     ) => {
                         debug!("Signaling shutdown to actors...");
@@ -279,24 +279,24 @@ pub async fn handle_events(
                             _ = &mut rendezvous => {
                                 info!(
                                     "Rendezvous complete within callback deadline,\
-                                     transitioning actor state to Ready"
+                                     transitioning consumer state to Ready"
                                 );
-                                ActorState::Ready
+                                ConsumerState::Ready
                             }
                             _ = sleep(CALLBACK_DURATION) => {
                                 debug!(
                                     "Unable to rendezvous within callback deadline, \
-                                    transitioning actor state to Draining"
+                                    transitioning consumer state to Draining"
                                 );
                                 todo!(
                                     "schedule a drain deadline here, \
-                                    poll it in the select arm, evaluate to ActorState::Draining"
+                                    poll it in the select arm, evaluate to ConsumerState::Draining"
                                 );
                             }
                         }
                     }
                     (
-                        ActorState::Consuming((_, shutdown_actors, mut rendezvous)),
+                        ConsumerState::Consuming((_, shutdown_actors, mut rendezvous)),
                         Event::Shutdown,
                     ) => {
                         debug!("Signaling shutdown to actors...");
@@ -307,25 +307,25 @@ pub async fn handle_events(
                             _ = &mut rendezvous => {
                                 info!(
                                     "Rendezvous complete within callback deadline, \
-                                    transitioning actor state to Stopped"
+                                    transitioning consumer state to Stopped"
                                 );
                                 debug!("Signaling shutdown to client...");
                                 shutdown_client.take();
-                                ActorState::Stopped
+                                ConsumerState::Stopped
                             }
                             _ = sleep(CALLBACK_DURATION) => {
                                 debug!(
                                     "Unable to rendezvous within callback deadline, \
-                                    transitioning actor state to Closing"
+                                    transitioning consumer state to Closing"
                                 );
                                 todo!(
                                     "schedule a drain deadline here, \
-                                    poll it in the select arm, evaluate to ActorState::Closing"
+                                    poll it in the select arm, evaluate to ConsumerState::Closing"
                                 );
                             }
                         }
                     }
-                    (ActorState::Stopped, _) => {
+                    (ConsumerState::Stopped, _) => {
                         unreachable!("Got event after consumer has stopped")
                     },
                 }
