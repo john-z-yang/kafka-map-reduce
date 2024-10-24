@@ -13,7 +13,7 @@ use rdkafka::{
 };
 use std::{
     cmp,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt::Debug,
     future::Future,
     mem::take,
@@ -41,7 +41,10 @@ pub mod reducers;
 pub async fn start_consumer(
     topics: &[&str],
     kafka_client_config: &ClientConfig,
-    spawn_actors: impl FnMut(Arc<StreamConsumer<KafkaContext>>, &[(String, i32)]) -> ActorHandles,
+    spawn_actors: impl FnMut(
+        Arc<StreamConsumer<KafkaContext>>,
+        &BTreeSet<(String, i32)>,
+    ) -> ActorHandles,
 ) -> Result<(), Error> {
     let (client_shutdown_sender, client_shutdown_receiver) = oneshot::channel();
     let (event_sender, event_receiver) = unbounded_channel();
@@ -151,8 +154,8 @@ impl ConsumerContext for KafkaContext {
 
 #[derive(Debug)]
 pub enum Event {
-    Assign(Vec<(String, i32)>),
-    Revoke(Vec<(String, i32)>),
+    Assign(BTreeSet<(String, i32)>),
+    Revoke(BTreeSet<(String, i32)>),
     Shutdown,
 }
 
@@ -195,7 +198,7 @@ macro_rules! processing_strategy {
         }
     ) => {{
         |consumer: Arc<rdkafka::consumer::StreamConsumer<$crate::KafkaContext>>,
-         tpl: &[(String, i32)]|
+         tpl: &std::collections::BTreeSet<(String, i32)>|
          -> $crate::ActorHandles {
             let start = std::time::Instant::now();
 
@@ -261,7 +264,7 @@ macro_rules! processing_strategy {
 #[derive(Debug)]
 enum ConsumerState {
     Ready,
-    Consuming(ActorHandles),
+    Consuming(ActorHandles, BTreeSet<(String, i32)>),
     Stopped,
 }
 
@@ -270,7 +273,10 @@ pub async fn handle_events(
     consumer: Arc<StreamConsumer<KafkaContext>>,
     events: UnboundedReceiver<(Event, SyncSender<()>)>,
     shutdown_client: oneshot::Sender<()>,
-    mut spawn_actors: impl FnMut(Arc<StreamConsumer<KafkaContext>>, &[(String, i32)]) -> ActorHandles,
+    mut spawn_actors: impl FnMut(
+        Arc<StreamConsumer<KafkaContext>>,
+        &BTreeSet<(String, i32)>,
+    ) -> ActorHandles,
 ) -> Result<(), anyhow::Error> {
     const CALLBACK_DURATION: Duration = Duration::from_secs(1);
 
@@ -280,27 +286,46 @@ pub async fn handle_events(
     let mut state = ConsumerState::Ready;
 
     while let ConsumerState::Ready { .. } | ConsumerState::Consuming { .. } = state {
-        let Some((event, _rendezvous_guard)) = &mut events_stream.next().await else {
+        let Some((event, _rendezvous_guard)) = events_stream.next().await else {
             unreachable!("Unexpected end to event stream")
         };
         info!("Recieved event: {:?}", event);
         state = match (state, event) {
             (ConsumerState::Ready, Event::Assign(tpl)) => {
-                ConsumerState::Consuming(spawn_actors(consumer.clone(), tpl))
+                ConsumerState::Consuming(spawn_actors(consumer.clone(), &tpl), tpl)
             }
             (ConsumerState::Ready, Event::Revoke(_)) => {
                 unreachable!("Got partition revocation before the consumer has started")
             }
             (ConsumerState::Ready, Event::Shutdown) => ConsumerState::Stopped,
-            (ConsumerState::Consuming { .. }, Event::Assign(_)) => {
-                unreachable!("Got partition assignment after consumer has started")
-            }
-            (ConsumerState::Consuming(actor_handles), Event::Revoke(_)) => {
+            (ConsumerState::Consuming(actor_handles, mut tpl), Event::Assign(mut assigned_tpl)) => {
+                assert!(
+                    tpl.is_disjoint(&assigned_tpl),
+                    "Newly assigned TPL should be disjoint from TPL we're consuming from"
+                );
+                tpl.append(&mut assigned_tpl);
+                debug!(
+                    "{} additional topic partitions added after assignment",
+                    assigned_tpl.len()
+                );
                 actor_handles.shutdown(CALLBACK_DURATION).await;
-                debug!("Transitioning consumer state to Ready");
-                ConsumerState::Ready
+                ConsumerState::Consuming(spawn_actors(consumer.clone(), &tpl), tpl)
             }
-            (ConsumerState::Consuming(actor_handles), Event::Shutdown) => {
+            (ConsumerState::Consuming(actor_handles, mut tpl), Event::Revoke(revoked_tpl)) => {
+                assert!(
+                    tpl.is_subset(&revoked_tpl),
+                    "Revoked TPL should be a subset of TPL we're consuming from"
+                );
+                tpl.retain(|e| !revoked_tpl.contains(e));
+                debug!("{} topic partitions remaining after revocation", tpl.len());
+                actor_handles.shutdown(CALLBACK_DURATION).await;
+                if tpl.is_empty() {
+                    ConsumerState::Ready
+                } else {
+                    ConsumerState::Consuming(spawn_actors(consumer.clone(), &tpl), tpl)
+                }
+            }
+            (ConsumerState::Consuming(actor_handles, _), Event::Shutdown) => {
                 actor_handles.shutdown(CALLBACK_DURATION).await;
                 debug!("Signaling shutdown to client...");
                 shutdown_client.take();
