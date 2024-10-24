@@ -156,11 +156,33 @@ pub enum Event {
     Shutdown,
 }
 
-pub type ActorHandles = (
-    JoinSet<Result<(), Error>>,
-    CancellationToken,
-    oneshot::Receiver<()>,
-);
+#[derive(Debug)]
+pub struct ActorHandles {
+    pub join_set: JoinSet<Result<(), Error>>,
+    pub shutdown: CancellationToken,
+    pub rendezvous: oneshot::Receiver<()>,
+}
+
+impl ActorHandles {
+    async fn shutdown(mut self, deadline: Duration) {
+        debug!("Signaling shutdown to actors...");
+        self.shutdown.cancel();
+        info!("Actor shutdown signaled, waiting for rendezvous...");
+
+        select! {
+            _ = self.rendezvous => {
+                info!("Rendezvous complete within callback deadline.");
+            }
+            _ = sleep(deadline) => {
+                error!(
+                    "Unable to rendezvous within callback deadline, \
+                    aborting all tasks within JoinSet"
+                );
+                self.join_set.abort_all();
+            }
+        }
+    }
+}
 
 #[macro_export]
 macro_rules! processing_strategy {
@@ -222,7 +244,11 @@ macro_rules! processing_strategy {
                 rendezvous_sender,
             ));
 
-            (handles, shutdown_signal, rendezvous_receiver)
+            $crate::ActorHandles {
+                join_set: handles,
+                shutdown: shutdown_signal,
+                rendezvous: rendezvous_receiver,
+            }
         }
     }};
 }
@@ -256,7 +282,6 @@ pub async fn handle_events(
         state = match (state, event) {
             (ConsumerState::Ready, Event::Assign(tpl)) => {
                 let handles = spawn_actors(consumer.clone(), &tpl);
-
                 ConsumerState::Consuming(handles)
             }
             (ConsumerState::Ready, Event::Revoke(_)) => {
@@ -266,49 +291,13 @@ pub async fn handle_events(
             (ConsumerState::Consuming { .. }, Event::Assign(_)) => {
                 unreachable!("Got partition assignment after consumer has started")
             }
-            (
-                ConsumerState::Consuming((mut join_set, shutdown_actors, mut rendezvous)),
-                Event::Revoke(_),
-            ) => {
-                debug!("Signaling shutdown to actors...");
-                shutdown_actors.cancel();
-                info!("Actor shutdown signaled, waiting for rendezvous...");
-
-                select! {
-                    _ = &mut rendezvous => {
-                        info!("Rendezvous complete within callback deadline.");
-                    }
-                    _ = sleep(CALLBACK_DURATION) => {
-                        error!(
-                            "Unable to rendezvous within callback deadline, \
-                            aborting all tasks within JoinSet"
-                        );
-                        join_set.abort_all();
-                    }
-                }
+            (ConsumerState::Consuming(actor_handles), Event::Revoke(_)) => {
+                actor_handles.shutdown(CALLBACK_DURATION).await;
                 debug!("Transitioning consumer state to Ready");
                 ConsumerState::Ready
             }
-            (
-                ConsumerState::Consuming((mut join_set, shutdown_actors, mut rendezvous)),
-                Event::Shutdown,
-            ) => {
-                debug!("Signaling shutdown to actors...");
-                shutdown_actors.cancel();
-                info!("Actor shutdown signaled, waiting for rendezvous...");
-
-                select! {
-                    _ = &mut rendezvous => {
-                        info!("Rendezvous complete within callback deadline.");
-                    }
-                    _ = sleep(CALLBACK_DURATION) => {
-                        error!(
-                            "Unable to rendezvous within callback deadline, \
-                            aborting all tasks within JoinSet"
-                        );
-                        join_set.abort_all();
-                    }
-                }
+            (ConsumerState::Consuming(actor_handles), Event::Shutdown) => {
+                actor_handles.shutdown(CALLBACK_DURATION).await;
                 debug!("Signaling shutdown to client...");
                 shutdown_client.take();
                 ConsumerState::Stopped
