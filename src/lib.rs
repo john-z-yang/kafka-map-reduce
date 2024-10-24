@@ -282,8 +282,7 @@ pub async fn handle_events(
         info!("Recieved event: {:?}", event);
         state = match (state, event) {
             (ConsumerState::Ready, Event::Assign(tpl)) => {
-                let handles = spawn_actors(consumer.clone(), &tpl);
-                ConsumerState::Consuming(handles)
+                ConsumerState::Consuming(spawn_actors(consumer.clone(), tpl))
             }
             (ConsumerState::Ready, Event::Revoke(_)) => {
                 unreachable!("Got partition revocation before the consumer has started")
