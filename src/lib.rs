@@ -117,7 +117,7 @@ impl ConsumerContext for KafkaContext {
         let (rendezvous_sender, rendezvous_receiver) = sync_channel(0);
         match rebalance {
             Rebalance::Assign(tpl) => {
-                info!("Got pre-rebalance callback, kind: Assign");
+                debug!("Got pre-rebalance callback, kind: Assign");
                 let _ = self.event_sender.send((
                     Event::Assign(tpl.to_topic_map().keys().cloned().collect()),
                     rendezvous_sender,
@@ -127,7 +127,7 @@ impl ConsumerContext for KafkaContext {
                 info!("Rendezvous complete");
             }
             Rebalance::Revoke(tpl) => {
-                info!("Got pre-rebalance callback, kind: Revoke");
+                debug!("Got pre-rebalance callback, kind: Revoke");
                 let _ = self.event_sender.send((
                     Event::Revoke(tpl.to_topic_map().keys().cloned().collect()),
                     rendezvous_sender,
@@ -137,7 +137,7 @@ impl ConsumerContext for KafkaContext {
                 info!("Rendezvous complete");
             }
             Rebalance::Error(err) => {
-                info!("Got pre-rebalance callback, kind: Error");
+                debug!("Got pre-rebalance callback, kind: Error");
                 error!("Got rebalance error: {}", err);
             }
         }
