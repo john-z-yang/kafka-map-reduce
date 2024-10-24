@@ -484,11 +484,8 @@ pub enum ReduceShutdownBehaviour {
 pub trait Reducer {
     type Item;
 
-    fn reduce(
-        &mut self,
-        t: Self::Item,
-    ) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send;
-    fn flush(&mut self) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send;
+    fn reduce(&mut self, t: Self::Item) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
+    fn flush(&mut self) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
     fn reset(&mut self);
     fn is_full(&self) -> bool;
     fn get_reduce_config(&self) -> ReduceConfig;
