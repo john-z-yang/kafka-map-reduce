@@ -266,57 +266,52 @@ pub async fn handle_events(
             (ConsumerState::Consuming { .. }, Event::Assign(_)) => {
                 unreachable!("Got partition assignment after consumer has started")
             }
-            (ConsumerState::Consuming((_, shutdown_actors, mut rendezvous)), Event::Revoke(_)) => {
+            (
+                ConsumerState::Consuming((mut join_set, shutdown_actors, mut rendezvous)),
+                Event::Revoke(_),
+            ) => {
                 debug!("Signaling shutdown to actors...");
                 shutdown_actors.cancel();
                 info!("Actor shutdown signaled, waiting for rendezvous...");
 
                 select! {
                     _ = &mut rendezvous => {
-                        info!(
-                            "Rendezvous complete within callback deadline,\
-                             transitioning consumer state to Ready"
-                        );
-                        ConsumerState::Ready
+                        info!("Rendezvous complete within callback deadline.");
                     }
                     _ = sleep(CALLBACK_DURATION) => {
-                        debug!(
+                        error!(
                             "Unable to rendezvous within callback deadline, \
-                            transitioning consumer state to Draining"
+                            aborting all tasks within JoinSet"
                         );
-                        todo!(
-                            "schedule a drain deadline here, \
-                            poll it in the select arm, evaluate to ConsumerState::Draining"
-                        );
+                        join_set.abort_all();
                     }
                 }
+                debug!("Transitioning consumer state to Ready");
+                ConsumerState::Ready
             }
-            (ConsumerState::Consuming((_, shutdown_actors, mut rendezvous)), Event::Shutdown) => {
+            (
+                ConsumerState::Consuming((mut join_set, shutdown_actors, mut rendezvous)),
+                Event::Shutdown,
+            ) => {
                 debug!("Signaling shutdown to actors...");
                 shutdown_actors.cancel();
                 info!("Actor shutdown signaled, waiting for rendezvous...");
 
                 select! {
                     _ = &mut rendezvous => {
-                        info!(
-                            "Rendezvous complete within callback deadline, \
-                            transitioning consumer state to Stopped"
-                        );
-                        debug!("Signaling shutdown to client...");
-                        shutdown_client.take();
-                        ConsumerState::Stopped
+                        info!("Rendezvous complete within callback deadline.");
                     }
                     _ = sleep(CALLBACK_DURATION) => {
-                        debug!(
+                        error!(
                             "Unable to rendezvous within callback deadline, \
-                            transitioning consumer state to Closing"
+                            aborting all tasks within JoinSet"
                         );
-                        todo!(
-                            "schedule a drain deadline here, \
-                            poll it in the select arm, evaluate to ConsumerState::Closing"
-                        );
+                        join_set.abort_all();
                     }
                 }
+                debug!("Signaling shutdown to client...");
+                shutdown_client.take();
+                ConsumerState::Stopped
             }
             (ConsumerState::Stopped, _) => {
                 unreachable!("Got event after consumer has stopped")
