@@ -207,7 +207,7 @@ macro_rules! processing_strategy {
             let reducer = $reduce;
             let err_reducer = $reduce_err;
 
-            const CHANNEL_BUFF_SIZE: usize = 64;
+            const CHANNEL_BUFF_SIZE: usize = 128;
             let (reduce_sender, reduce_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
             let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
             let (err_sender, err_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
