@@ -164,6 +164,7 @@ pub struct ActorHandles {
 }
 
 impl ActorHandles {
+    #[instrument(skip(self))]
     async fn shutdown(mut self, deadline: Duration) {
         debug!("Signaling shutdown to actors...");
         self.shutdown.cancel();
@@ -311,7 +312,7 @@ pub async fn handle_events(
     Ok(())
 }
 
-trait KafkaMessage {
+pub trait KafkaMessage {
     fn detach(&self) -> Result<OwnedMessage, Error>;
 }
 
@@ -327,7 +328,7 @@ impl KafkaMessage for Result<BorrowedMessage<'_>, KafkaError> {
     }
 }
 
-trait MessageQueue {
+pub trait MessageQueue {
     fn stream(&self) -> impl Stream<Item = impl KafkaMessage>;
 }
 
