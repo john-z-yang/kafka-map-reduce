@@ -197,6 +197,8 @@ macro_rules! processing_strategy {
         |consumer: Arc<rdkafka::consumer::StreamConsumer<$crate::KafkaContext>>,
          tpl: &[(String, i32)]|
          -> $crate::ActorHandles {
+            let start = std::time::Instant::now();
+
             let mut handles = tokio::task::JoinSet::new();
             let mut shutdown_signal = tokio_util::sync::CancellationToken::new();
 
@@ -244,6 +246,8 @@ macro_rules! processing_strategy {
                 consumer.clone(),
                 rendezvous_sender,
             ));
+
+            tracing::debug!("Creating actors took {:?}", start.elapsed());
 
             $crate::ActorHandles {
                 join_set: handles,
