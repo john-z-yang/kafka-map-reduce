@@ -36,7 +36,7 @@ async fn main() -> Result<(), Error> {
                 host,
                 port,
                 table,
-                32_768,
+                128,
                 Duration::from_secs(4),
                 ReduceShutdownBehaviour::Flush,
             ),

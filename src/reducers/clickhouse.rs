@@ -1,11 +1,57 @@
 use crate::{ReduceConfig, ReduceShutdownBehaviour, Reducer};
 use anyhow::{anyhow, Ok};
-use reqwest::Client;
-use std::{collections::HashMap, mem::replace, time::Duration};
+use reqwest::{Client, Error, Response};
+use std::{collections::HashMap, time::Duration};
+use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
+struct WriteHandle {
+    max_size: usize,
+    cur_size: usize,
+    write_stream: mpsc::Sender<Result<Vec<u8>, ::std::io::Error>>,
+    response_handle: JoinHandle<Result<Response, Error>>,
+}
+
+impl WriteHandle {
+    fn new(client: Client, url: String, max_size: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(max_size);
+
+        Self {
+            max_size,
+            cur_size: 0,
+            write_stream: sender,
+            response_handle: tokio::spawn(async move {
+                client
+                    .post(url)
+                    .body(reqwest::Body::wrap_stream(ReceiverStream::new(receiver)))
+                    .send()
+                    .await
+            }),
+        }
+    }
+
+    async fn write(&mut self, data: Vec<u8>) -> Result<(), Error> {
+        self.write_stream
+            .send(Result::<_, _>::Ok(data))
+            .await
+            .map_err(|err| anyhow!("Unable to write to socket, got SendError: {:?}", err))
+            .expect("We are always sending Ok during write");
+        self.cur_size += 1;
+        Result::<_, _>::Ok(())
+    }
+
+    fn flush(self) -> JoinHandle<Result<Response, Error>> {
+        self.response_handle
+    }
+
+    fn is_full(&self) -> bool {
+        self.cur_size >= self.max_size
+    }
+}
+
 pub struct ClickhouseBatchWriter {
-    buffer: Vec<u8>,
+    write_handle: Option<WriteHandle>,
     http_client: Client,
     max_buf_size: usize,
     url: String,
@@ -22,7 +68,7 @@ impl ClickhouseBatchWriter {
         shutdown_behaviour: ReduceShutdownBehaviour,
     ) -> Self {
         Self {
-            buffer: Vec::with_capacity(max_buf_size),
+            write_handle: None,
             http_client: Client::new(),
             max_buf_size,
             url: format!(
@@ -41,23 +87,24 @@ impl Reducer for ClickhouseBatchWriter {
     type Item = Vec<u8>;
 
     async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
-        self.buffer.extend(&t);
+        self.write_handle
+            .get_or_insert_with(|| {
+                WriteHandle::new(
+                    self.http_client.clone(),
+                    self.url.clone(),
+                    self.max_buf_size,
+                )
+            })
+            .write(t)
+            .await?;
         Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), anyhow::Error> {
-        if self.buffer.is_empty() {
+        if self.write_handle.is_none() {
             return Ok(());
         }
-        let res = self
-            .http_client
-            .post(self.url.clone())
-            .body(replace(
-                &mut self.buffer,
-                Vec::with_capacity(self.max_buf_size),
-            ))
-            .send()
-            .await?;
+        let res = self.write_handle.take().unwrap().flush().await??;
 
         if res.status().as_str() == "200" {
             info!(
@@ -78,11 +125,13 @@ impl Reducer for ClickhouseBatchWriter {
     }
 
     fn reset(&mut self) {
-        self.buffer.clear();
+        self.write_handle.take();
     }
 
     fn is_full(&self) -> bool {
-        self.buffer.len() >= self.max_buf_size
+        self.write_handle
+            .as_ref()
+            .map_or(false, WriteHandle::is_full)
     }
 
     fn get_reduce_config(&self) -> ReduceConfig {
