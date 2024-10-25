@@ -46,6 +46,10 @@ impl WriteHandle {
         self.response_handle
     }
 
+    fn abort(&self) {
+        self.response_handle.abort();
+    }
+
     fn is_full(&self) -> bool {
         self.cur_size >= self.max_size
     }
@@ -137,5 +141,11 @@ impl Reducer for ClickhouseBatchWriter {
 
     fn get_reduce_config(&self) -> ReduceConfig {
         self.reduce_config.clone()
+    }
+}
+
+impl Drop for ClickhouseBatchWriter {
+    fn drop(&mut self) {
+        self.write_handle.as_ref().map(WriteHandle::abort);
     }
 }
