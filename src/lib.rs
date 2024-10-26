@@ -472,6 +472,7 @@ impl From<HighwaterMark> for TopicPartitionList {
 #[derive(Debug, Clone)]
 pub struct ReduceConfig {
     pub shutdown_behaviour: ReduceShutdownBehaviour,
+    pub when_full_behaviour: ReducerWhenFullBehaviour,
     pub flush_interval: Option<Duration>,
 }
 
@@ -479,6 +480,12 @@ pub struct ReduceConfig {
 pub enum ReduceShutdownBehaviour {
     Flush,
     Drop,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReducerWhenFullBehaviour {
+    Flush,
+    Backpressure,
 }
 
 pub trait Reducer {
@@ -629,13 +636,17 @@ pub async fn reduce<T>(
                     ).await;
                 }
 
-                if flush_timer.is_none() {
-                    inflight_msgs.clear();
-                    if !highwater_mark.is_empty() {
-                        ok.send(take(&mut highwater_mark).into())
-                            .await
-                            .map_err(|err| anyhow!("{}", err))?;
-                    }
+                if matches!(config.when_full_behaviour, ReducerWhenFullBehaviour::Flush)
+                    && reducer.is_full()
+                {
+                    flush_reducer(
+                        &mut reducer,
+                        &mut inflight_msgs,
+                        &mut highwater_mark,
+                        &ok,
+                        &err,
+                    )
+                    .await?;
                 }
             }
         }
@@ -710,10 +721,19 @@ pub async fn reduce_err(
                     .await
                     .expect("error reducer reduce should always be successful");
 
-                if flush_timer.is_none() && !highwater_mark.is_empty() {
-                    ok.send(take(&mut highwater_mark).into())
+                if matches!(config.when_full_behaviour, ReducerWhenFullBehaviour::Flush)
+                    && reducer.is_full()
+                {
+                    reducer
+                        .flush()
                         .await
-                        .map_err(|err| anyhow!("{}", err))?;
+                        .expect("error reducer flush should always be successful");
+
+                    if !highwater_mark.is_empty() {
+                        ok.send(take(&mut highwater_mark).into())
+                            .await
+                            .map_err(|err| anyhow!("{}", err))?;
+                    }
                 }
             }
         }
@@ -787,6 +807,7 @@ mod tests {
     }
 
     struct StreamingReducer<T> {
+        data: Option<T>,
         pipe: Arc<RwLock<Vec<T>>>,
         error_on_idx: Option<usize>,
     }
@@ -794,6 +815,7 @@ mod tests {
     impl<T> StreamingReducer<T> {
         fn new(error_on_idx: Option<usize>) -> Self {
             Self {
+                data: None,
                 pipe: Arc::new(RwLock::new(Vec::new())),
                 error_on_idx,
             }
@@ -817,23 +839,28 @@ mod tests {
                     return Err(anyhow!("err"));
                 }
             }
-            self.pipe.write().unwrap().push(t);
+            assert!(self.data.is_none());
+            self.data = Some(t);
             Ok(())
         }
 
         async fn flush(&mut self) -> Result<(), anyhow::Error> {
+            self.pipe.write().unwrap().push(self.data.take().unwrap());
             Ok(())
         }
 
-        fn reset(&mut self) {}
+        fn reset(&mut self) {
+            self.data.take();
+        }
 
         fn is_full(&self) -> bool {
-            false
+            self.data.is_some()
         }
 
         fn get_reduce_config(&self) -> ReduceConfig {
             ReduceConfig {
                 shutdown_behaviour: ReduceShutdownBehaviour::Drop,
+                when_full_behaviour: crate::ReducerWhenFullBehaviour::Flush,
                 flush_interval: None,
             }
         }
@@ -911,6 +938,7 @@ mod tests {
         fn get_reduce_config(&self) -> crate::ReduceConfig {
             ReduceConfig {
                 shutdown_behaviour: ReduceShutdownBehaviour::Flush,
+                when_full_behaviour: crate::ReducerWhenFullBehaviour::Backpressure,
                 flush_interval: Some(Duration::from_secs(1)),
             }
         }

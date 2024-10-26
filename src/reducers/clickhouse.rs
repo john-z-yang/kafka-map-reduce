@@ -1,4 +1,4 @@
-use crate::{ReduceConfig, ReduceShutdownBehaviour, Reducer};
+use crate::{ReduceConfig, ReduceShutdownBehaviour, Reducer, ReducerWhenFullBehaviour};
 use anyhow::{anyhow, Error, Ok};
 use reqwest::{Client, Response};
 use std::{collections::HashMap, time::Duration};
@@ -82,6 +82,7 @@ impl ClickhouseBatchWriter {
             ),
             reduce_config: ReduceConfig {
                 shutdown_behaviour,
+                when_full_behaviour: ReducerWhenFullBehaviour::Backpressure,
                 flush_interval: Some(flush_interval),
             },
         }
