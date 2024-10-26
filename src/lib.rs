@@ -605,15 +605,7 @@ pub async fn reduce<T>(
 
             val = receiver.recv(), if !reducer.is_full() => {
                 let Some((msg, value)) = val else {
-                    debug!("Received end of stream, flushing reducer...");
-                    flush_reducer(
-                        &mut reducer,
-                        &mut inflight_msgs,
-                        &mut highwater_mark,
-                        &ok,
-                        &err,
-                    ).await?;
-                    break;
+                    unreachable!("Received end of stream without shutdown signal");
                 };
 
                 highwater_mark.track(&msg);
@@ -707,12 +699,7 @@ pub async fn reduce_err(
 
             val = receiver.recv(), if !reducer.is_full() => {
                 let Some(msg) = val else {
-                    debug!("Received end of stream, flushing reducer...");
-                    reducer
-                        .flush()
-                        .await
-                        .expect("error reducer flush should always be successful");
-                    break;
+                    unreachable!("Received end of stream without shutdown signal");
                 };
                 highwater_mark.track(&msg);
 
