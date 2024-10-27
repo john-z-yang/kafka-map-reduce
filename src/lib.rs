@@ -425,50 +425,6 @@ where
     Ok(())
 }
 
-#[derive(Default)]
-struct HighwaterMark {
-    data: HashMap<(String, i32), i64>,
-}
-
-impl HighwaterMark {
-    fn new() -> Self {
-        Self {
-            data: HashMap::new(),
-        }
-    }
-
-    fn track(&mut self, msg: &OwnedMessage) {
-        let cur_offset = self
-            .data
-            .entry((msg.topic().to_string(), msg.partition()))
-            .or_insert(msg.offset() + 1);
-        *cur_offset = cmp::max(*cur_offset, msg.offset() + 1);
-    }
-
-    fn clear(&mut self) {
-        self.data.clear();
-    }
-
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-}
-
-impl From<HighwaterMark> for TopicPartitionList {
-    fn from(val: HighwaterMark) -> Self {
-        let mut tpl = TopicPartitionList::with_capacity(val.len());
-        for ((topic, partition), offset) in val.data.iter() {
-            tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset))
-                .expect("Partition offset should always be valid");
-        }
-        tpl
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ReduceConfig {
     pub shutdown_behaviour: ReduceShutdownBehaviour,
@@ -501,7 +457,6 @@ pub trait Reducer {
 async fn handle_reducer_failure<T>(
     reducer: &mut impl Reducer<Item = T>,
     inflight_msgs: &mut Vec<OwnedMessage>,
-    highwater_mark: &mut HighwaterMark,
     err: &mpsc::Sender<OwnedMessage>,
 ) {
     for msg in take(inflight_msgs).into_iter() {
@@ -509,49 +464,24 @@ async fn handle_reducer_failure<T>(
             .await
             .expect("reduce_err should always be available");
     }
-    highwater_mark.clear();
     reducer.reset();
 }
 
-#[instrument(skip(reducer, inflight_msgs, highwater_mark, ok, err))]
-async fn shutdown_reducer<T>(
-    shutdown_behaviour: ReduceShutdownBehaviour,
-    mut reducer: impl Reducer<Item = T>,
-    inflight_msgs: &mut Vec<OwnedMessage>,
-    highwater_mark: &mut HighwaterMark,
-    ok: &mpsc::Sender<TopicPartitionList>,
-    err: &mpsc::Sender<OwnedMessage>,
-) -> Result<(), Error> {
-    match shutdown_behaviour {
-        ReduceShutdownBehaviour::Flush => {
-            debug!("Received shutdown signal, flushing reducer...");
-            flush_reducer(&mut reducer, inflight_msgs, highwater_mark, ok, err).await?;
-        }
-        ReduceShutdownBehaviour::Drop => {
-            debug!("Received shutdown signal, dropping reducer...");
-            drop(reducer);
-        }
-    };
-    Ok(())
-}
-
-#[instrument(skip(reducer, inflight_msgs, highwater_mark, ok, err))]
+#[instrument(skip(reducer, inflight_msgs, ok, err))]
 async fn flush_reducer<T>(
     reducer: &mut impl Reducer<Item = T>,
     inflight_msgs: &mut Vec<OwnedMessage>,
-    highwater_mark: &mut HighwaterMark,
-    ok: &mpsc::Sender<TopicPartitionList>,
+    ok: &mpsc::Sender<Vec<OwnedMessage>>,
     err: &mpsc::Sender<OwnedMessage>,
 ) -> Result<(), Error> {
     match reducer.flush().await {
         Err(e) => {
             error!("Failed to flush reducer, reason: {}", e);
-            handle_reducer_failure(reducer, inflight_msgs, highwater_mark, err).await;
+            handle_reducer_failure(reducer, inflight_msgs, err).await;
         }
         Ok(()) => {
-            inflight_msgs.clear();
-            if !highwater_mark.is_empty() {
-                ok.send(take(highwater_mark).into())
+            if !inflight_msgs.is_empty() {
+                ok.send(take(inflight_msgs))
                     .await
                     .map_err(|err| anyhow!("{}", err))?;
             }
@@ -564,12 +494,11 @@ async fn flush_reducer<T>(
 pub async fn reduce<T>(
     mut reducer: impl Reducer<Item = T>,
     mut receiver: mpsc::Receiver<(OwnedMessage, T)>,
-    ok: mpsc::Sender<TopicPartitionList>,
+    ok: mpsc::Sender<Vec<OwnedMessage>>,
     err: mpsc::Sender<OwnedMessage>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
-    let mut highwater_mark = HighwaterMark::new();
     let mut flush_timer = config.flush_interval.map(time::interval);
     let mut inflight_msgs = Vec::new();
 
@@ -578,14 +507,16 @@ pub async fn reduce<T>(
             biased;
 
             _ = shutdown.cancelled() => {
-                shutdown_reducer(
-                    config.shutdown_behaviour,
-                    reducer,
-                    &mut inflight_msgs,
-                    &mut highwater_mark,
-                    &ok,
-                    &err,
-                ).await?;
+                match config.shutdown_behaviour {
+                    ReduceShutdownBehaviour::Flush => {
+                        debug!("Received shutdown signal, flushing reducer...");
+                        flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
+                    }
+                    ReduceShutdownBehaviour::Drop => {
+                        debug!("Received shutdown signal, dropping reducer...");
+                        drop(reducer);
+                    }
+                };
                 break;
             }
 
@@ -594,13 +525,7 @@ pub async fn reduce<T>(
             } else {
                 Either::Right(future::pending::<_>())
             } => {
-                flush_reducer(
-                    &mut reducer,
-                    &mut inflight_msgs,
-                    &mut highwater_mark,
-                    &ok,
-                    &err,
-                ).await?;
+                flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
             }
 
             val = receiver.recv(), if !reducer.is_full() => {
@@ -608,7 +533,6 @@ pub async fn reduce<T>(
                     unreachable!("Received end of stream without shutdown signal");
                 };
 
-                highwater_mark.track(&msg);
                 inflight_msgs.push(msg);
 
                 if let Err(e) = reducer.reduce(value).await {
@@ -620,25 +544,13 @@ pub async fn reduce<T>(
                         inflight_msgs.last().unwrap().offset(),
                         e,
                     );
-                    handle_reducer_failure(
-                        &mut reducer,
-                        &mut inflight_msgs,
-                        &mut highwater_mark,
-                        &err,
-                    ).await;
+                    handle_reducer_failure(&mut reducer, &mut inflight_msgs, &err).await;
                 }
 
                 if matches!(config.when_full_behaviour, ReducerWhenFullBehaviour::Flush)
                     && reducer.is_full()
                 {
-                    flush_reducer(
-                        &mut reducer,
-                        &mut inflight_msgs,
-                        &mut highwater_mark,
-                        &ok,
-                        &err,
-                    )
-                    .await?;
+                    flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
                 }
             }
         }
@@ -652,12 +564,12 @@ pub async fn reduce<T>(
 pub async fn reduce_err(
     mut reducer: impl Reducer<Item = OwnedMessage>,
     mut receiver: mpsc::Receiver<OwnedMessage>,
-    ok: mpsc::Sender<TopicPartitionList>,
+    ok: mpsc::Sender<Vec<OwnedMessage>>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
-    let mut highwater_mark = HighwaterMark::new();
     let mut flush_timer = config.flush_interval.map(time::interval);
+    let mut inflight_msgs = Vec::new();
 
     loop {
         select! {
@@ -671,6 +583,11 @@ pub async fn reduce_err(
                             .flush()
                             .await
                             .expect("error reducer flush should always be successful");
+                        if !inflight_msgs.is_empty() {
+                            ok.send(take(&mut inflight_msgs).into())
+                                .await
+                                .map_err(|err| anyhow!("{}", err))?;
+                        }
                     },
                     ReduceShutdownBehaviour::Drop => {
                         debug!("Received shutdown signal, dropping reducer...");
@@ -689,9 +606,8 @@ pub async fn reduce_err(
                     .flush()
                     .await
                     .expect("error reducer flush should always be successful");
-
-                if !highwater_mark.is_empty() {
-                    ok.send(take(&mut highwater_mark).into())
+                if !inflight_msgs.is_empty() {
+                    ok.send(take(&mut inflight_msgs).into())
                         .await
                         .map_err(|err| anyhow!("{}", err))?;
                 }
@@ -701,7 +617,7 @@ pub async fn reduce_err(
                 let Some(msg) = val else {
                     unreachable!("Received end of stream without shutdown signal");
                 };
-                highwater_mark.track(&msg);
+                inflight_msgs.push(msg.clone());
 
                 reducer
                     .reduce(msg)
@@ -716,8 +632,8 @@ pub async fn reduce_err(
                         .await
                         .expect("error reducer flush should always be successful");
 
-                    if !highwater_mark.is_empty() {
-                        ok.send(take(&mut highwater_mark).into())
+                    if !inflight_msgs.is_empty() {
+                        ok.send(take(&mut inflight_msgs).into())
                             .await
                             .map_err(|err| anyhow!("{}", err))?;
                     }
@@ -740,15 +656,53 @@ impl CommitClient for StreamConsumer<KafkaContext> {
     }
 }
 
+#[derive(Default)]
+struct HighwaterMark {
+    data: HashMap<(String, i32), i64>,
+}
+
+impl HighwaterMark {
+    fn new() -> Self {
+        Self {
+            data: HashMap::new(),
+        }
+    }
+
+    fn track(&mut self, msg: &OwnedMessage) {
+        let cur_offset = self
+            .data
+            .entry((msg.topic().to_string(), msg.partition()))
+            .or_insert(msg.offset() + 1);
+        *cur_offset = cmp::max(*cur_offset, msg.offset() + 1);
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl From<HighwaterMark> for TopicPartitionList {
+    fn from(val: HighwaterMark) -> Self {
+        let mut tpl = TopicPartitionList::with_capacity(val.len());
+        for ((topic, partition), offset) in val.data.iter() {
+            tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset))
+                .expect("Partition offset should always be valid");
+        }
+        tpl
+    }
+}
+
 #[instrument(skip(receiver, consumer, _rendezvous_guard))]
 pub async fn commit(
-    mut receiver: mpsc::Receiver<TopicPartitionList>,
+    mut receiver: mpsc::Receiver<Vec<OwnedMessage>>,
     consumer: Arc<impl CommitClient>,
     _rendezvous_guard: oneshot::Sender<()>,
 ) -> Result<(), Error> {
-    while let Some(ref tpl) = receiver.recv().await {
+    while let Some(msgs) = receiver.recv().await {
         debug!("Storing offsets");
-        consumer.store_offsets(tpl).unwrap();
+        let mut highwater_mark = HighwaterMark::new();
+        msgs.iter().for_each(|msg| highwater_mark.track(msg));
+        consumer.store_offsets(&highwater_mark.into()).unwrap();
     }
     debug!("Shutdown complete");
     Ok(())
@@ -941,13 +895,28 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let (rendezvou_sender, rendezvou_receiver) = oneshot::channel();
 
-        let tpl = TopicPartitionList::from_topic_map(&HashMap::from([
-            (("topic".to_string(), 0), Offset::Offset(0)),
-            (("topic".to_string(), 1), Offset::Offset(0)),
-        ]))
-        .unwrap();
+        let msg = vec![
+            OwnedMessage::new(
+                None,
+                None,
+                "topic".to_string(),
+                Timestamp::NotAvailable,
+                0,
+                1,
+                None,
+            ),
+            OwnedMessage::new(
+                None,
+                None,
+                "topic".to_string(),
+                Timestamp::NotAvailable,
+                1,
+                0,
+                None,
+            ),
+        ];
 
-        assert!(sender.send(tpl.clone()).await.is_ok());
+        assert!(sender.send(msg.clone()).await.is_ok());
 
         tokio::spawn(commit(receiver, commit_client, rendezvou_sender));
 
@@ -955,7 +924,14 @@ mod tests {
         let _ = rendezvou_receiver.await;
 
         assert_eq!(offsets.read().unwrap().len(), 1);
-        assert_eq!(offsets.read().unwrap()[0], tpl);
+        assert_eq!(
+            offsets.read().unwrap()[0],
+            TopicPartitionList::from_topic_map(&HashMap::from([
+                (("topic".to_string(), 0), Offset::Offset(2)),
+                (("topic".to_string(), 1), Offset::Offset(1))
+            ]))
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -986,12 +962,8 @@ mod tests {
 
         assert!(sender.send(msg.clone()).await.is_ok());
         assert_eq!(
-            commit_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(1)
-            )]))
-            .unwrap()
+            commit_receiver.recv().await.unwrap()[0].payload(),
+            msg.payload()
         );
         assert_eq!(
             pipe.read().unwrap().last().unwrap().payload().unwrap(),
@@ -1046,20 +1018,12 @@ mod tests {
         assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
 
         assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(1)
-            )]))
-            .unwrap()
+            ok_receiver.recv().await.unwrap()[0].payload(),
+            msg_0.payload()
         );
         assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(2)
-            )]))
-            .unwrap()
+            ok_receiver.recv().await.unwrap()[0].payload(),
+            msg_1.payload()
         );
         assert_eq!(pipe.read().unwrap().as_slice(), &[1, 2]);
         assert!(err_receiver.is_empty());
@@ -1120,12 +1084,8 @@ mod tests {
 
         assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
         assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(1)
-            )]))
-            .unwrap()
+            ok_receiver.recv().await.unwrap()[0].payload(),
+            msg_0.payload(),
         );
         assert_eq!(pipe.read().unwrap().as_slice(), &[1]);
 
@@ -1138,12 +1098,8 @@ mod tests {
 
         assert!(sender.send((msg_2.clone(), 3)).await.is_ok());
         assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(3)
-            )]))
-            .unwrap()
+            ok_receiver.recv().await.unwrap()[0].payload(),
+            msg_2.payload(),
         );
         assert_eq!(pipe.read().unwrap().as_slice(), &[1, 3]);
 
@@ -1187,12 +1143,8 @@ mod tests {
 
         assert!(sender.send(msg.clone()).await.is_ok());
         assert_eq!(
-            commit_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(1)
-            )]))
-            .unwrap()
+            commit_receiver.recv().await.unwrap()[0].payload(),
+            msg.payload()
         );
         assert_eq!(pipe.read().unwrap()[0].payload(), msg.payload());
         assert!(buffer.read().unwrap().is_empty());
@@ -1245,14 +1197,10 @@ mod tests {
         assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
         assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
 
-        assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(2)
-            )]))
-            .unwrap()
-        );
+        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert_eq!(ok_msgs.len(), 2);
+        assert_eq!(ok_msgs[0].payload(), msg_0.payload());
+        assert_eq!(ok_msgs[1].payload(), msg_1.payload());
         assert!(buffer.read().unwrap().is_empty());
         assert_eq!(pipe.read().unwrap().as_slice(), &[1, 2]);
         assert!(err_receiver.is_empty());
@@ -1313,14 +1261,9 @@ mod tests {
         ));
 
         assert!(sender.send((msg_0.clone(), 0)).await.is_ok());
-        assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(1)
-            )]))
-            .unwrap()
-        );
+        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert_eq!(ok_msgs.len(), 1);
+        assert_eq!(ok_msgs[0].payload(), msg_0.payload());
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
@@ -1333,14 +1276,9 @@ mod tests {
         assert_eq!(pipe.read().unwrap().as_slice(), &[0] as &[i32]);
 
         assert!(sender.send((msg_2.clone(), 2)).await.is_ok());
-        assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(3)
-            )]))
-            .unwrap()
-        );
+        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert_eq!(ok_msgs.len(), 1);
+        assert_eq!(ok_msgs[0].payload(), msg_2.payload());
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0, 2] as &[i32]);
 
@@ -1409,15 +1347,10 @@ mod tests {
         ));
 
         assert!(sender.send((msg_0.clone(), 0)).await.is_ok());
+        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert_eq!(ok_msgs.len(), 1);
+        assert_eq!(ok_msgs[0].payload(), msg_0.payload());
 
-        assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(1)
-            )]))
-            .unwrap()
-        );
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
@@ -1434,15 +1367,10 @@ mod tests {
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
-        assert!(sender.send((msg_3, 3)).await.is_ok());
-        assert_eq!(
-            ok_receiver.recv().await.unwrap(),
-            TopicPartitionList::from_topic_map(&HashMap::from([(
-                ("topic".to_string(), 0),
-                Offset::Offset(4)
-            )]))
-            .unwrap()
-        );
+        assert!(sender.send((msg_3.clone(), 3)).await.is_ok());
+        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert_eq!(ok_msgs.len(), 1);
+        assert_eq!(ok_msgs[0].payload(), msg_3.payload());
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0, 3]);
 

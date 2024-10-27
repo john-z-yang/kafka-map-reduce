@@ -37,9 +37,12 @@ where
     }
 
     async fn flush(&mut self) -> Result<(), anyhow::Error> {
+        let Some(data) = self.data.take() else {
+            return Ok(());
+        };
         match self.os_stream {
-            OsStream::StdOut => println!("{:?}", self.data.take().unwrap()),
-            OsStream::StdErr => eprintln!("{:?}", self.data.take().unwrap()),
+            OsStream::StdOut => println!("{:?}", data),
+            OsStream::StdErr => eprintln!("{:?}", data),
         }
         sleep(self.print_duration).await;
         Ok(())
