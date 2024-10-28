@@ -29,9 +29,10 @@ impl<T> Reducer for OsStreamWriter<T>
 where
     T: Debug + Send,
 {
-    type Item = T;
+    type Input = T;
+    type Output = ();
 
-    async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+    async fn reduce(&mut self, t: Self::Input) -> Result<(), anyhow::Error> {
         self.data = Some(t);
         Ok(())
     }

@@ -90,9 +90,10 @@ impl ClickhouseBatchWriter {
 }
 
 impl Reducer for ClickhouseBatchWriter {
-    type Item = Vec<u8>;
+    type Input = Vec<u8>;
+    type Output = ();
 
-    async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+    async fn reduce(&mut self, t: Self::Input) -> Result<(), anyhow::Error> {
         self.write_handle
             .get_or_insert_with(|| {
                 WriteHandle::new(

@@ -16,6 +16,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt::Debug,
     future::Future,
+    iter,
     mem::take,
     sync::{
         mpsc::{sync_channel, SyncSender},
@@ -370,7 +371,7 @@ impl MessageQueue for StreamPartitionQueue<KafkaContext> {
 pub async fn map<Fut, R>(
     queue: impl MessageQueue,
     transform: impl Fn(Arc<OwnedMessage>) -> Fut,
-    ok: mpsc::Sender<(OwnedMessage, R)>,
+    ok: mpsc::Sender<(iter::Once<OwnedMessage>, R)>,
     err: mpsc::Sender<OwnedMessage>,
     shutdown: CancellationToken,
 ) -> Result<(), Error>
@@ -396,7 +397,7 @@ where
                 match transform(msg.clone()).await {
                     Ok(transformed) => {
                         ok.send((
-                            Arc::try_unwrap(msg).expect("msg should only have a single strong ref"),
+                            iter::once(Arc::try_unwrap(msg).expect("msg should only have a single strong ref")),
                             transformed,
                         ))
                         .await
@@ -445,17 +446,18 @@ pub enum ReducerWhenFullBehaviour {
 }
 
 pub trait Reducer {
-    type Item;
+    type Input;
+    type Output;
 
-    fn reduce(&mut self, t: Self::Item) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
-    fn flush(&mut self) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
+    fn reduce(&mut self, t: Self::Input) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
+    fn flush(&mut self) -> impl Future<Output = Result<Self::Output, anyhow::Error>> + Send;
     fn reset(&mut self);
     fn is_full(&self) -> bool;
     fn get_reduce_config(&self) -> ReduceConfig;
 }
 
 async fn handle_reducer_failure<T>(
-    reducer: &mut impl Reducer<Item = T>,
+    reducer: &mut impl Reducer<Input = T>,
     inflight_msgs: &mut Vec<OwnedMessage>,
     err: &mpsc::Sender<OwnedMessage>,
 ) {
@@ -468,10 +470,10 @@ async fn handle_reducer_failure<T>(
 }
 
 #[instrument(skip(reducer, inflight_msgs, ok, err))]
-async fn flush_reducer<T>(
-    reducer: &mut impl Reducer<Item = T>,
+async fn flush_reducer<T, U>(
+    reducer: &mut impl Reducer<Input = T, Output = U>,
     inflight_msgs: &mut Vec<OwnedMessage>,
-    ok: &mpsc::Sender<Vec<OwnedMessage>>,
+    ok: &mpsc::Sender<(Vec<OwnedMessage>, U)>,
     err: &mpsc::Sender<OwnedMessage>,
 ) -> Result<(), Error> {
     match reducer.flush().await {
@@ -479,9 +481,9 @@ async fn flush_reducer<T>(
             error!("Failed to flush reducer, reason: {}", e);
             handle_reducer_failure(reducer, inflight_msgs, err).await;
         }
-        Ok(()) => {
+        Ok(result) => {
             if !inflight_msgs.is_empty() {
-                ok.send(take(inflight_msgs))
+                ok.send((take(inflight_msgs), result))
                     .await
                     .map_err(|err| anyhow!("{}", err))?;
             }
@@ -491,10 +493,10 @@ async fn flush_reducer<T>(
 }
 
 #[instrument(skip(reducer, receiver, ok, err, shutdown))]
-pub async fn reduce<T>(
-    mut reducer: impl Reducer<Item = T>,
-    mut receiver: mpsc::Receiver<(OwnedMessage, T)>,
-    ok: mpsc::Sender<Vec<OwnedMessage>>,
+pub async fn reduce<T, U>(
+    mut reducer: impl Reducer<Input = T, Output = U>,
+    mut receiver: mpsc::Receiver<(impl IntoIterator<Item = OwnedMessage>, T)>,
+    ok: mpsc::Sender<(Vec<OwnedMessage>, U)>,
     err: mpsc::Sender<OwnedMessage>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
@@ -533,7 +535,7 @@ pub async fn reduce<T>(
                     unreachable!("Received end of stream without shutdown signal");
                 };
 
-                inflight_msgs.push(msg);
+                inflight_msgs.extend(msg);
 
                 if let Err(e) = reducer.reduce(value).await {
                     error!(
@@ -562,9 +564,9 @@ pub async fn reduce<T>(
 
 #[instrument(skip(reducer, receiver, ok, shutdown))]
 pub async fn reduce_err(
-    mut reducer: impl Reducer<Item = OwnedMessage>,
+    mut reducer: impl Reducer<Input = OwnedMessage, Output = ()>,
     mut receiver: mpsc::Receiver<OwnedMessage>,
-    ok: mpsc::Sender<Vec<OwnedMessage>>,
+    ok: mpsc::Sender<(Vec<OwnedMessage>, ())>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
@@ -584,7 +586,7 @@ pub async fn reduce_err(
                             .await
                             .expect("error reducer flush should always be successful");
                         if !inflight_msgs.is_empty() {
-                            ok.send(take(&mut inflight_msgs).into())
+                            ok.send((take(&mut inflight_msgs), ()))
                                 .await
                                 .map_err(|err| anyhow!("{}", err))?;
                         }
@@ -607,7 +609,7 @@ pub async fn reduce_err(
                     .await
                     .expect("error reducer flush should always be successful");
                 if !inflight_msgs.is_empty() {
-                    ok.send(take(&mut inflight_msgs).into())
+                    ok.send((take(&mut inflight_msgs), ()))
                         .await
                         .map_err(|err| anyhow!("{}", err))?;
                 }
@@ -633,7 +635,7 @@ pub async fn reduce_err(
                         .expect("error reducer flush should always be successful");
 
                     if !inflight_msgs.is_empty() {
-                        ok.send(take(&mut inflight_msgs).into())
+                        ok.send((take(&mut inflight_msgs), ()))
                             .await
                             .map_err(|err| anyhow!("{}", err))?;
                     }
@@ -694,14 +696,14 @@ impl From<HighwaterMark> for TopicPartitionList {
 
 #[instrument(skip(receiver, consumer, _rendezvous_guard))]
 pub async fn commit(
-    mut receiver: mpsc::Receiver<Vec<OwnedMessage>>,
+    mut receiver: mpsc::Receiver<(Vec<OwnedMessage>, ())>,
     consumer: Arc<impl CommitClient>,
     _rendezvous_guard: oneshot::Sender<()>,
 ) -> Result<(), Error> {
     while let Some(msgs) = receiver.recv().await {
         debug!("Storing offsets");
         let mut highwater_mark = HighwaterMark::new();
-        msgs.iter().for_each(|msg| highwater_mark.track(msg));
+        msgs.0.iter().for_each(|msg| highwater_mark.track(msg));
         consumer.store_offsets(&highwater_mark.into()).unwrap();
     }
     debug!("Shutdown complete");
@@ -712,6 +714,7 @@ pub async fn commit(
 mod tests {
     use std::{
         collections::HashMap,
+        iter,
         mem::take,
         sync::{Arc, RwLock},
         time::Duration,
@@ -771,9 +774,11 @@ mod tests {
     where
         T: Send + Sync + Clone,
     {
-        type Item = T;
+        type Input = T;
 
-        async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+        type Output = ();
+
+        async fn reduce(&mut self, t: Self::Input) -> Result<(), anyhow::Error> {
             if let Some(idx) = self.error_on_idx {
                 if idx == self.pipe.read().unwrap().len() {
                     self.error_on_idx.take();
@@ -837,9 +842,10 @@ mod tests {
     where
         T: Send + Sync + Clone,
     {
-        type Item = T;
+        type Input = T;
+        type Output = ();
 
-        async fn reduce(&mut self, t: Self::Item) -> Result<(), anyhow::Error> {
+        async fn reduce(&mut self, t: Self::Input) -> Result<(), anyhow::Error> {
             if let Some(idx) = self.error_on_nth_reduce {
                 if idx == 0 {
                     self.error_on_nth_reduce.take();
@@ -916,7 +922,7 @@ mod tests {
             ),
         ];
 
-        assert!(sender.send(msg.clone()).await.is_ok());
+        assert!(sender.send((msg.clone(), ())).await.is_ok());
 
         tokio::spawn(commit(receiver, commit_client, rendezvou_sender));
 
@@ -962,7 +968,7 @@ mod tests {
 
         assert!(sender.send(msg.clone()).await.is_ok());
         assert_eq!(
-            commit_receiver.recv().await.unwrap()[0].payload(),
+            commit_receiver.recv().await.unwrap().0[0].payload(),
             msg.payload()
         );
         assert_eq!(
@@ -1014,15 +1020,15 @@ mod tests {
             shutdown.clone(),
         ));
 
-        assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
-        assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
+        assert!(sender.send((iter::once(msg_0.clone()), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 2)).await.is_ok());
 
         assert_eq!(
-            ok_receiver.recv().await.unwrap()[0].payload(),
+            ok_receiver.recv().await.unwrap().0[0].payload(),
             msg_0.payload()
         );
         assert_eq!(
-            ok_receiver.recv().await.unwrap()[0].payload(),
+            ok_receiver.recv().await.unwrap().0[0].payload(),
             msg_1.payload()
         );
         assert_eq!(pipe.read().unwrap().as_slice(), &[1, 2]);
@@ -1082,23 +1088,23 @@ mod tests {
             shutdown.clone(),
         ));
 
-        assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_0.clone()), 1)).await.is_ok());
         assert_eq!(
-            ok_receiver.recv().await.unwrap()[0].payload(),
+            ok_receiver.recv().await.unwrap().0[0].payload(),
             msg_0.payload(),
         );
         assert_eq!(pipe.read().unwrap().as_slice(), &[1]);
 
-        assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 2)).await.is_ok());
         assert_eq!(
             err_receiver.recv().await.unwrap().payload(),
             msg_1.payload()
         );
         assert_eq!(pipe.read().unwrap().as_slice(), &[1]);
 
-        assert!(sender.send((msg_2.clone(), 3)).await.is_ok());
+        assert!(sender.send((iter::once(msg_2.clone()), 3)).await.is_ok());
         assert_eq!(
-            ok_receiver.recv().await.unwrap()[0].payload(),
+            ok_receiver.recv().await.unwrap().0[0].payload(),
             msg_2.payload(),
         );
         assert_eq!(pipe.read().unwrap().as_slice(), &[1, 3]);
@@ -1143,7 +1149,7 @@ mod tests {
 
         assert!(sender.send(msg.clone()).await.is_ok());
         assert_eq!(
-            commit_receiver.recv().await.unwrap()[0].payload(),
+            commit_receiver.recv().await.unwrap().0[0].payload(),
             msg.payload()
         );
         assert_eq!(pipe.read().unwrap()[0].payload(), msg.payload());
@@ -1194,10 +1200,10 @@ mod tests {
             shutdown.clone(),
         ));
 
-        assert!(sender.send((msg_0.clone(), 1)).await.is_ok());
-        assert!(sender.send((msg_1.clone(), 2)).await.is_ok());
+        assert!(sender.send((iter::once(msg_0.clone()), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 2)).await.is_ok());
 
-        let ok_msgs = ok_receiver.recv().await.unwrap();
+        let ok_msgs = ok_receiver.recv().await.unwrap().0;
         assert_eq!(ok_msgs.len(), 2);
         assert_eq!(ok_msgs[0].payload(), msg_0.payload());
         assert_eq!(ok_msgs[1].payload(), msg_1.payload());
@@ -1260,14 +1266,14 @@ mod tests {
             shutdown.clone(),
         ));
 
-        assert!(sender.send((msg_0.clone(), 0)).await.is_ok());
-        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert!(sender.send((iter::once(msg_0.clone()), 0)).await.is_ok());
+        let ok_msgs = ok_receiver.recv().await.unwrap().0;
         assert_eq!(ok_msgs.len(), 1);
         assert_eq!(ok_msgs[0].payload(), msg_0.payload());
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
-        assert!(sender.send((msg_1.clone(), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 1)).await.is_ok());
         assert_eq!(
             err_receiver.recv().await.unwrap().payload(),
             msg_1.payload()
@@ -1275,8 +1281,8 @@ mod tests {
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0] as &[i32]);
 
-        assert!(sender.send((msg_2.clone(), 2)).await.is_ok());
-        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert!(sender.send((iter::once(msg_2.clone()), 2)).await.is_ok());
+        let ok_msgs = ok_receiver.recv().await.unwrap().0;
         assert_eq!(ok_msgs.len(), 1);
         assert_eq!(ok_msgs[0].payload(), msg_2.payload());
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
@@ -1346,16 +1352,16 @@ mod tests {
             shutdown.clone(),
         ));
 
-        assert!(sender.send((msg_0.clone(), 0)).await.is_ok());
-        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert!(sender.send((iter::once(msg_0.clone()), 0)).await.is_ok());
+        let ok_msgs = ok_receiver.recv().await.unwrap().0;
         assert_eq!(ok_msgs.len(), 1);
         assert_eq!(ok_msgs[0].payload(), msg_0.payload());
 
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
-        assert!(sender.send((msg_1.clone(), 1)).await.is_ok());
-        assert!(sender.send((msg_2.clone(), 2)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_2.clone()), 2)).await.is_ok());
         assert_eq!(
             err_receiver.recv().await.unwrap().payload(),
             msg_1.payload()
@@ -1367,8 +1373,8 @@ mod tests {
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
         assert_eq!(pipe.read().unwrap().as_slice(), &[0]);
 
-        assert!(sender.send((msg_3.clone(), 3)).await.is_ok());
-        let ok_msgs = ok_receiver.recv().await.unwrap();
+        assert!(sender.send((iter::once(msg_3.clone()), 3)).await.is_ok());
+        let ok_msgs = ok_receiver.recv().await.unwrap().0;
         assert_eq!(ok_msgs.len(), 1);
         assert_eq!(ok_msgs[0].payload(), msg_3.payload());
         assert_eq!(buffer.read().unwrap().as_slice(), &[] as &[i32]);
@@ -1442,13 +1448,19 @@ mod tests {
         assert!(sender.send(Ok(msg_0.clone())).is_ok());
         assert!(err_receiver.is_empty());
         let res = ok_receiver.recv().await.unwrap();
-        assert_eq!(res.0.payload(), Some(msg_0.payload.clone()).as_deref());
+        assert_eq!(
+            res.0.collect::<Vec<_>>()[0].payload(),
+            Some(msg_0.payload.clone()).as_deref()
+        );
         assert_eq!(res.1, msg_0.payload[0] * 2);
 
         assert!(sender.send(Ok(msg_1.clone())).is_ok());
         assert!(err_receiver.is_empty());
         let res = ok_receiver.recv().await.unwrap();
-        assert_eq!(res.0.payload(), Some(msg_1.payload.clone()).as_deref());
+        assert_eq!(
+            res.0.collect::<Vec<_>>()[0].payload(),
+            Some(msg_1.payload.clone()).as_deref()
+        );
         assert_eq!(res.1, msg_1.payload[0] * 2);
 
         shutdown.cancel();
@@ -1501,7 +1513,10 @@ mod tests {
         assert!(sender.send(Ok(msg_0.clone())).is_ok());
         assert!(err_receiver.is_empty());
         let res = ok_receiver.recv().await.unwrap();
-        assert_eq!(res.0.payload(), Some(msg_0.payload).as_deref());
+        assert_eq!(
+            res.0.collect::<Vec<_>>()[0].payload(),
+            Some(msg_0.payload).as_deref()
+        );
         assert_eq!(res.1, 0);
 
         assert!(sender.send(Ok(msg_1.clone())).is_ok());
@@ -1512,12 +1527,95 @@ mod tests {
         assert!(sender.send(Ok(msg_2.clone())).is_ok());
         assert!(err_receiver.is_empty());
         let res = ok_receiver.recv().await.unwrap();
-        assert_eq!(res.0.payload(), Some(msg_2.payload).as_deref());
+        assert_eq!(
+            res.0.collect::<Vec<_>>()[0].payload(),
+            Some(msg_2.payload).as_deref()
+        );
         assert_eq!(res.1, 4);
 
         shutdown.cancel();
         sleep(Duration::from_secs(1)).await;
         assert!(ok_receiver.is_closed());
         assert!(err_receiver.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_sequential_reducers() {
+        let reducer_0 = BatchingReducer::new(None, None);
+        let buffer_0 = reducer_0.get_buffer();
+        let pipe_0 = reducer_0.get_pipe();
+
+        let reducer_1 = BatchingReducer::new(None, None);
+        let buffer_1 = reducer_1.get_buffer();
+        let pipe_1 = reducer_1.get_pipe();
+
+        let shutdown = CancellationToken::new();
+
+        let (sender, receiver) = mpsc::channel(1);
+        let (ok_sender_0, ok_receiver_0) = mpsc::channel(2);
+        let (err_sender_0, err_receiver_0) = mpsc::channel(1);
+
+        let (ok_sender_1, mut ok_receiver_1) = mpsc::channel(1);
+        let (err_sender_1, err_receiver_1) = mpsc::channel(1);
+
+        let msg_0 = OwnedMessage::new(
+            Some(vec![0, 2, 4, 6]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            0,
+            None,
+        );
+        let msg_1 = OwnedMessage::new(
+            Some(vec![1, 3, 5, 7]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            1,
+            None,
+        );
+
+        tokio::spawn(reduce(
+            reducer_0,
+            receiver,
+            ok_sender_0,
+            err_sender_0,
+            shutdown.clone(),
+        ));
+
+        tokio::spawn(reduce(
+            reducer_1,
+            ok_receiver_0,
+            ok_sender_1,
+            err_sender_1,
+            shutdown.clone(),
+        ));
+
+        assert!(sender.send((iter::once(msg_0.clone()), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 2)).await.is_ok());
+
+        let ok_msgs = ok_receiver_1.recv().await.unwrap().0;
+        assert_eq!(ok_msgs.len(), 2);
+        assert_eq!(ok_msgs[0].payload(), msg_0.payload());
+        assert_eq!(ok_msgs[1].payload(), msg_1.payload());
+
+        assert!(buffer_0.read().unwrap().is_empty());
+        assert_eq!(pipe_0.read().unwrap().as_slice(), &[1, 2]);
+
+        assert!(buffer_1.read().unwrap().is_empty());
+        assert_eq!(pipe_1.read().unwrap().as_slice(), &[()]);
+
+        assert!(err_receiver_0.is_empty());
+        assert!(err_receiver_1.is_empty());
+
+        drop(sender);
+        shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(err_receiver_0.is_closed());
+        assert!(ok_receiver_1.is_closed());
+        assert!(err_receiver_1.is_closed());
     }
 }
