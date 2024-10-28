@@ -368,15 +368,15 @@ impl MessageQueue for StreamPartitionQueue<KafkaContext> {
 }
 
 #[instrument(skip(queue, transform, ok, err, shutdown))]
-pub async fn map<Fut, R>(
+pub async fn map<T, F>(
     queue: impl MessageQueue,
-    transform: impl Fn(Arc<OwnedMessage>) -> Fut,
-    ok: mpsc::Sender<(iter::Once<OwnedMessage>, R)>,
+    transform: impl Fn(Arc<OwnedMessage>) -> F,
+    ok: mpsc::Sender<(iter::Once<OwnedMessage>, T)>,
     err: mpsc::Sender<OwnedMessage>,
     shutdown: CancellationToken,
 ) -> Result<(), Error>
 where
-    Fut: Future<Output = Result<R, Error>> + Send,
+    F: Future<Output = Result<T, Error>> + Send,
 {
     let stream = queue.stream();
     pin_mut!(stream);
