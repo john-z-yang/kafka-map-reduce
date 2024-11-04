@@ -428,18 +428,25 @@ where
 
 #[derive(Debug, Clone)]
 pub struct ReduceConfig {
+    pub shutdown_condition: ReduceShutdownCondition,
     pub shutdown_behaviour: ReduceShutdownBehaviour,
     pub when_full_behaviour: ReducerWhenFullBehaviour,
     pub flush_interval: Option<Duration>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceShutdownCondition {
+    Signal,
+    Drain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReduceShutdownBehaviour {
     Flush,
     Drop,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReducerWhenFullBehaviour {
     Flush,
     Backpressure,
@@ -508,7 +515,11 @@ pub async fn reduce<T, U>(
         select! {
             biased;
 
-            _ = shutdown.cancelled() => {
+            _ = if config.shutdown_condition == ReduceShutdownCondition::Signal {
+                Either::Left(shutdown.cancelled())
+            } else {
+                Either::Right(future::pending::<_>())
+            } => {
                 match config.shutdown_behaviour {
                     ReduceShutdownBehaviour::Flush => {
                         debug!("Received shutdown signal, flushing reducer...");
@@ -532,7 +543,22 @@ pub async fn reduce<T, U>(
 
             val = receiver.recv(), if !reducer.is_full() => {
                 let Some((msg, value)) = val else {
-                    unreachable!("Received end of stream without shutdown signal");
+                    assert_eq!(
+                        config.shutdown_condition,
+                        ReduceShutdownCondition::Drain,
+                        "Got end of stream without shutdown signal"
+                    );
+                    match config.shutdown_behaviour {
+                        ReduceShutdownBehaviour::Flush => {
+                            debug!("Received end of stream, flushing reducer...");
+                            flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
+                        }
+                        ReduceShutdownBehaviour::Drop => {
+                            debug!("Received end of stream, dropping reducer...");
+                            drop(reducer);
+                        }
+                    };
+                    break;
                 };
 
                 inflight_msgs.extend(msg);
@@ -549,7 +575,7 @@ pub async fn reduce<T, U>(
                     handle_reducer_failure(&mut reducer, &mut inflight_msgs, &err).await;
                 }
 
-                if matches!(config.when_full_behaviour, ReducerWhenFullBehaviour::Flush)
+                if config.when_full_behaviour == ReducerWhenFullBehaviour::Flush
                     && reducer.is_full()
                 {
                     flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
@@ -736,7 +762,7 @@ mod tests {
 
     use crate::{
         commit, map, reduce, reduce_err, CommitClient, KafkaMessage, MessageQueue, ReduceConfig,
-        ReduceShutdownBehaviour, Reducer,
+        ReduceShutdownBehaviour, ReduceShutdownCondition, Reducer,
     };
 
     struct MockCommitClient {
@@ -805,6 +831,7 @@ mod tests {
 
         fn get_reduce_config(&self) -> ReduceConfig {
             ReduceConfig {
+                shutdown_condition: ReduceShutdownCondition::Signal,
                 shutdown_behaviour: ReduceShutdownBehaviour::Drop,
                 when_full_behaviour: crate::ReducerWhenFullBehaviour::Flush,
                 flush_interval: None,
@@ -817,15 +844,21 @@ mod tests {
         pipe: Arc<RwLock<Vec<T>>>,
         error_on_nth_reduce: Option<usize>,
         error_on_nth_flush: Option<usize>,
+        shutdown_condition: ReduceShutdownCondition,
     }
 
     impl<T> BatchingReducer<T> {
-        fn new(error_on_reduce: Option<usize>, error_on_flush: Option<usize>) -> Self {
+        fn new(
+            error_on_reduce: Option<usize>,
+            error_on_flush: Option<usize>,
+            shutdown_condition: ReduceShutdownCondition,
+        ) -> Self {
             Self {
                 buffer: Arc::new(RwLock::new(Vec::new())),
                 pipe: Arc::new(RwLock::new(Vec::new())),
                 error_on_nth_reduce: error_on_reduce,
                 error_on_nth_flush: error_on_flush,
+                shutdown_condition,
             }
         }
 
@@ -884,6 +917,7 @@ mod tests {
 
         fn get_reduce_config(&self) -> crate::ReduceConfig {
             ReduceConfig {
+                shutdown_condition: self.shutdown_condition,
                 shutdown_behaviour: ReduceShutdownBehaviour::Flush,
                 when_full_behaviour: crate::ReducerWhenFullBehaviour::Backpressure,
                 flush_interval: Some(Duration::from_secs(1)),
@@ -1122,7 +1156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reduce_err_with_flush_interval() {
-        let reducer = BatchingReducer::new(None, None);
+        let reducer = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1164,7 +1198,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reduce_with_flush_interval() {
-        let reducer = BatchingReducer::new(None, None);
+        let reducer = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1221,7 +1255,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_on_reduce_with_flush_interval() {
-        let reducer = BatchingReducer::new(Some(1), None);
+        let reducer = BatchingReducer::new(Some(1), None, ReduceShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1298,7 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_on_flush() {
-        let reducer = BatchingReducer::new(None, Some(1));
+        let reducer = BatchingReducer::new(None, Some(1), ReduceShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1386,6 +1420,145 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         assert!(ok_receiver.is_empty());
         assert!(err_receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sequential_reducers() {
+        let reducer_0 = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
+        let buffer_0 = reducer_0.get_buffer();
+        let pipe_0 = reducer_0.get_pipe();
+
+        let reducer_1 = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
+        let buffer_1 = reducer_1.get_buffer();
+        let pipe_1 = reducer_1.get_pipe();
+
+        let shutdown = CancellationToken::new();
+
+        let (sender, receiver) = mpsc::channel(1);
+        let (ok_sender_0, ok_receiver_0) = mpsc::channel(2);
+        let (err_sender_0, err_receiver_0) = mpsc::channel(1);
+
+        let (ok_sender_1, mut ok_receiver_1) = mpsc::channel(1);
+        let (err_sender_1, err_receiver_1) = mpsc::channel(1);
+
+        let msg_0 = OwnedMessage::new(
+            Some(vec![0, 2, 4, 6]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            0,
+            None,
+        );
+        let msg_1 = OwnedMessage::new(
+            Some(vec![1, 3, 5, 7]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            1,
+            None,
+        );
+
+        tokio::spawn(reduce(
+            reducer_0,
+            receiver,
+            ok_sender_0,
+            err_sender_0,
+            shutdown.clone(),
+        ));
+
+        tokio::spawn(reduce(
+            reducer_1,
+            ok_receiver_0,
+            ok_sender_1,
+            err_sender_1,
+            shutdown.clone(),
+        ));
+
+        assert!(sender.send((iter::once(msg_0.clone()), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 2)).await.is_ok());
+
+        let ok_msgs = ok_receiver_1.recv().await.unwrap().0;
+        assert_eq!(ok_msgs.len(), 2);
+        assert_eq!(ok_msgs[0].payload(), msg_0.payload());
+        assert_eq!(ok_msgs[1].payload(), msg_1.payload());
+
+        assert!(buffer_0.read().unwrap().is_empty());
+        assert_eq!(pipe_0.read().unwrap().as_slice(), &[1, 2]);
+
+        assert!(buffer_1.read().unwrap().is_empty());
+        assert_eq!(pipe_1.read().unwrap().as_slice(), &[()]);
+
+        assert!(err_receiver_0.is_empty());
+        assert!(err_receiver_1.is_empty());
+
+        drop(sender);
+        shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(err_receiver_0.is_closed());
+        assert!(ok_receiver_1.is_closed());
+        assert!(err_receiver_1.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_reduce_shutdown_from_drain() {
+        let reducer = BatchingReducer::new(None, None, ReduceShutdownCondition::Drain);
+        let buffer = reducer.get_buffer();
+        let pipe = reducer.get_pipe();
+
+        let (sender, receiver) = mpsc::channel(2);
+        let (ok_sender, mut ok_receiver) = mpsc::channel(2);
+        let (err_sender, err_receiver) = mpsc::channel(2);
+        let shutdown = CancellationToken::new();
+
+        let msg_0 = OwnedMessage::new(
+            Some(vec![0, 2, 4, 6]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            0,
+            None,
+        );
+        let msg_1 = OwnedMessage::new(
+            Some(vec![1, 3, 5, 7]),
+            None,
+            "topic".to_string(),
+            Timestamp::now(),
+            0,
+            1,
+            None,
+        );
+
+        tokio::spawn(reduce(
+            reducer,
+            receiver,
+            ok_sender,
+            err_sender,
+            shutdown.clone(),
+        ));
+
+        shutdown.cancel();
+
+        assert!(sender.send((iter::once(msg_0.clone()), 1)).await.is_ok());
+        assert!(sender.send((iter::once(msg_1.clone()), 2)).await.is_ok());
+
+        let ok_msgs = ok_receiver.recv().await.unwrap().0;
+        assert_eq!(ok_msgs.len(), 2);
+        assert_eq!(ok_msgs[0].payload(), msg_0.payload());
+        assert_eq!(ok_msgs[1].payload(), msg_1.payload());
+        assert!(buffer.read().unwrap().is_empty());
+        assert_eq!(pipe.read().unwrap().as_slice(), &[1, 2]);
+        assert!(err_receiver.is_empty());
+
+        drop(sender);
+        shutdown.cancel();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(ok_receiver.is_closed());
+        assert!(err_receiver.is_closed());
     }
 
     #[derive(Clone)]
@@ -1537,85 +1710,5 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         assert!(ok_receiver.is_closed());
         assert!(err_receiver.is_closed());
-    }
-
-    #[tokio::test]
-    async fn test_sequential_reducers() {
-        let reducer_0 = BatchingReducer::new(None, None);
-        let buffer_0 = reducer_0.get_buffer();
-        let pipe_0 = reducer_0.get_pipe();
-
-        let reducer_1 = BatchingReducer::new(None, None);
-        let buffer_1 = reducer_1.get_buffer();
-        let pipe_1 = reducer_1.get_pipe();
-
-        let shutdown = CancellationToken::new();
-
-        let (sender, receiver) = mpsc::channel(1);
-        let (ok_sender_0, ok_receiver_0) = mpsc::channel(2);
-        let (err_sender_0, err_receiver_0) = mpsc::channel(1);
-
-        let (ok_sender_1, mut ok_receiver_1) = mpsc::channel(1);
-        let (err_sender_1, err_receiver_1) = mpsc::channel(1);
-
-        let msg_0 = OwnedMessage::new(
-            Some(vec![0, 2, 4, 6]),
-            None,
-            "topic".to_string(),
-            Timestamp::now(),
-            0,
-            0,
-            None,
-        );
-        let msg_1 = OwnedMessage::new(
-            Some(vec![1, 3, 5, 7]),
-            None,
-            "topic".to_string(),
-            Timestamp::now(),
-            0,
-            1,
-            None,
-        );
-
-        tokio::spawn(reduce(
-            reducer_0,
-            receiver,
-            ok_sender_0,
-            err_sender_0,
-            shutdown.clone(),
-        ));
-
-        tokio::spawn(reduce(
-            reducer_1,
-            ok_receiver_0,
-            ok_sender_1,
-            err_sender_1,
-            shutdown.clone(),
-        ));
-
-        assert!(sender.send((iter::once(msg_0.clone()), 1)).await.is_ok());
-        assert!(sender.send((iter::once(msg_1.clone()), 2)).await.is_ok());
-
-        let ok_msgs = ok_receiver_1.recv().await.unwrap().0;
-        assert_eq!(ok_msgs.len(), 2);
-        assert_eq!(ok_msgs[0].payload(), msg_0.payload());
-        assert_eq!(ok_msgs[1].payload(), msg_1.payload());
-
-        assert!(buffer_0.read().unwrap().is_empty());
-        assert_eq!(pipe_0.read().unwrap().as_slice(), &[1, 2]);
-
-        assert!(buffer_1.read().unwrap().is_empty());
-        assert_eq!(pipe_1.read().unwrap().as_slice(), &[()]);
-
-        assert!(err_receiver_0.is_empty());
-        assert!(err_receiver_1.is_empty());
-
-        drop(sender);
-        shutdown.cancel();
-
-        sleep(Duration::from_secs(1)).await;
-        assert!(err_receiver_0.is_closed());
-        assert!(ok_receiver_1.is_closed());
-        assert!(err_receiver_1.is_closed());
     }
 }
