@@ -2,7 +2,7 @@
 
 A simple toy kafka consumer framework implementation in Rust. Build on top of [Tokio](https://tokio.rs/) and [rdkafka](https://docs.rs/rdkafka/latest/rdkafka/index.html)'s [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/stream_consumer/struct.StreamConsumer.html) to be fully asynchronous. Most techniques are stolen from [Vector](https://vector.dev/) and [Arroyo](https://github.com/getsentry/arroyo).
 
-It processes the messages from Kafka in 2 phases: a map phase and a reduce phase. The map phase runs completely in parallel on each partition the consumer is assigned to. The reduce phase performs some operations over all output of the map phase, either by time or by number of messages.
+It processes the messages from Kafka in 2 phases: a map phase and a reduce phase. The map phase runs completely in parallel on each partition the consumer is assigned to. The reduce phase runs in sequence and performs some operations over all output of the map phase within a period of time or number of messages. There can be one or more reduce steps.
 
 ## Demo
 
@@ -31,16 +31,19 @@ async fn main() -> Result<(), Error> {
             .set("enable.auto.offset.store", "false")
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
-            map => parse,
-            reduce => ClickhouseBatchWriter::new(
+            map: parse,
+            reduce: ClickhouseBatchWriter::new(
                 host,
                 port,
                 table,
                 128,
                 Duration::from_secs(4),
                 ReduceShutdownBehaviour::Flush,
-            ),
-            reduce_err => OsStreamWriter::new(
+            )
+            // Some arbiary number of reduce steps
+            => NoopReducer::new("Hello")
+            => NoopReducer::new("World"),
+            err: OsStreamWriter::new(
                 Duration::from_secs(1),
                 OsStream::StdErr,
             ),
@@ -48,6 +51,7 @@ async fn main() -> Result<(), Error> {
     )
     .await
 }
+
 ```
 
 Start the demo with:
@@ -104,41 +108,41 @@ HAVING occ > 1
 
 ## How it works
 
-Identical to [Vector](https://vector.dev/docs/about/under-the-hood/architecture/concurrency-model/). Each instance of a phase is a Tokio task. Tasks forward data to the next phase using a bounded MPSC channel for backpressure and buffering. The event handler task performs all the coordination necessary between events (such as Kafka partition reassignment or SIGKILL) and tasks. It uses a cancellation token for graceful shutdown signal and oneshot channels for synchronous rendezvous.
+Identical to [Vector](https://vector.dev/docs/about/under-the-hood/architecture/concurrency-model/). Each step is a Tokio task. Tasks forward data to the next phase using a bounded MPSC channel for backpressure and buffering. The event handler task performs all the coordination necessary between events (such as Kafka partition reassignment or SIGKILL) and tasks. It uses a cancellation token for graceful shutdown signal and oneshot channels for synchronous rendezvous.
 
 ### Architecture
 
 ```text
-┌───────────────────────────────────────────────────────────────────────────────────────┐
-│                                                          ┌──────────┐                 │
-│                            ┌───────────────────SIG──────►│Reduce Err├──OFF─────┐      │
-│                            │                             └──────────┘          │      │
-│                            │                                ▲   ▲              │      │
-│    ┌──────────┐            │                                │   │              │      │
-│    │OS signals│───SIG──┐   │                         ┌─MSG──┤  MSG             │      │
-│    └──────────┘        │   │                         │      │   │              │      │
-│                        ▼   │                         │      ▼   │              ▼      │
-│                   ┌─────────────┐                    │     ┌──────┐          ┌──────┐ │
-└─────SIG──────────►│Event Handler│──────────────SIG───┼────►│Reduce├────OFF──►│Commit├─┘
-                    └─────────────┘                    │     └──────┘          └──────┘  
-                         ▲   │                         │                                 
-┌───────────────┐        │   │       ┌─────────────┐   │                                 
-│Consumer client│◄──SIG──┘  SIG      │Map          │   │                                 
-└───────────────┘            │       │┌───────────┐│   │                                 
-                             ├──────►││Partition_0│├───┤                                 
-                             │       │└───────────┘│   │                                 
-                             │       └─────────────┘   │                                 
-                             │              .          │                                 
-                             │              .          │                                 
-                             │              .          │                                 
-                             │       ┌─────────────┐   │                                 
-                             │       │Map          │   │                                 
-                             │       │┌───────────┐│   │                                 
-                             └──────►││Partition_n│├───┘                                 
-                                     │└───────────┘│                                     
-                                     └─────────────┘                                     
-                                                                                         
-┌───────────────────────────────────────────┐                                            
-│ SIG: Signals  MSG: Messages  OFF: Offsets │                                            
-└───────────────────────────────────────────┘                                            
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                     ┌──────────┐                                             │
+│                            ┌───────────SIG─────────►│Reduce Err├──OFF───────────────────────────────────┐    │
+│                            │                        └──────────┘                                        │    │
+│                            │                           ▲   ▲                                            │    │
+│    ┌──────────┐            │                           │   │                                            │    │
+│    │OS signals│───SIG──┐   │                    ┌─MSG──┤  MSG────────────┬─────────────┐                │    │
+│    └──────────┘        │   │                    │      │   │             │             │                │    │
+│                        ▼   │                    │      ▼   │             │             │                ▼    │
+│                   ┌────────┴────┐               │     ┌────┴───┐         │         ┌───┴────┐        ┌──────┐│
+└─────SIG──────────►│Event Handler│──────SIG──────┼────►│Reduce_0│──MSG──►...──MSG──►│Reduce_m│──OFF──►│Commit│┘
+                    └────────┬────┘               │     └────────┘                   └────────┘        └──────┘ 
+                         ▲   │                    │                                                             
+┌───────────────┐        │   │   ┌─────────────┐  │                                                             
+│Consumer client│◄──SIG──┘  SIG  │Map          │  │                                                             
+└───────────────┘            │   │┌───────────┐│  │                                                             
+                             ├───┤│Partition_0│├──┤                                                             
+                             │   │└───────────┘│  │                                                             
+                             │   └─────────────┘  │                                                             
+                             │          .         │                                                             
+                             │          .         │                                                             
+                             │          .         │                                                             
+                             │   ┌─────────────┐  │                                                             
+                             │   │Map          │  │                                                             
+                             │   │┌───────────┐│  │                                                             
+                             └───┤│Partition_n│├──┘                                                             
+                                 │└───────────┘│                                                                
+                                 └─────────────┘                                                                
+                                                                                                                
+┌───────────────────────────────────────────┐                                                                   
+│ SIG: Signals  MSG: Messages  OFF: Offsets │                                                                   
+└───────────────────────────────────────────┘                                                                   
 ```

@@ -101,8 +101,8 @@ async fn main() -> Result<(), Error> {
             .set("enable.auto.offset.store", "false")
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
-            map => parse,
-            reduce => ClickhouseBatchWriter::new(
+            map: parse,
+            reduce: ClickhouseBatchWriter::new(
                 host,
                 port,
                 table,
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Error> {
                 Duration::from_secs(4),
                 ReduceShutdownBehaviour::Flush,
             ),
-            reduce_err => OsStreamWriter::new(
+            err: OsStreamWriter::new(
                 Duration::from_secs(1),
                 OsStream::StdErr,
             ),

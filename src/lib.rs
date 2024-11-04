@@ -192,10 +192,57 @@ impl ActorHandles {
 #[macro_export]
 macro_rules! processing_strategy {
     (
+        @reducers,
+        ($reduce:expr),
+        $prev_receiver:ident,
+        $err_sender:ident,
+        $shutdown_signal:ident,
+        $handles:ident,
+    ) => {{
+        let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+
+        $handles.spawn($crate::reduce(
+            $reduce,
+            $prev_receiver,
+            commit_sender.clone(),
+            $err_sender.clone(),
+            $shutdown_signal.clone(),
+        ));
+
+        (commit_sender, commit_receiver)
+    }};
+    (
+        @reducers,
+        ($reduce_first:expr $(,$reduce_rest:expr)+),
+        $prev_receiver:ident,
+        $err_sender:ident,
+        $shutdown_signal:ident,
+        $handles:ident,
+    ) => {{
+        let (sender, receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+
+        $handles.spawn($crate::reduce(
+            $reduce_first,
+            $prev_receiver,
+            sender.clone(),
+            $err_sender.clone(),
+            $shutdown_signal.clone(),
+        ));
+
+        processing_strategy!(
+            @reducers,
+            ($($reduce_rest),+),
+            receiver,
+            $err_sender,
+            $shutdown_signal,
+            $handles,
+        )
+    }};
+    (
         {
-            map => $map_fn:ident,
-            reduce => $reduce:expr,
-            reduce_err => $reduce_err:expr$(,)?
+            map: $map_fn:ident,
+            reduce: $reduce_first:expr $(=> $reduce_rest:expr)*,
+            err: $reduce_err:expr,
         }
     ) => {{
         |consumer: Arc<rdkafka::consumer::StreamConsumer<$crate::KafkaContext>>,
@@ -208,12 +255,8 @@ macro_rules! processing_strategy {
 
             let (rendezvous_sender, rendezvous_receiver) = tokio::sync::oneshot::channel();
 
-            let reducer = $reduce;
-            let err_reducer = $reduce_err;
-
             const CHANNEL_BUFF_SIZE: usize = 128;
-            let (reduce_sender, reduce_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
-            let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+            let (map_sender, reduce_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
             let (err_sender, err_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
 
             for (topic, partition) in tpl.iter() {
@@ -224,31 +267,32 @@ macro_rules! processing_strategy {
                 handles.spawn($crate::map(
                     queue,
                     $map_fn,
-                    reduce_sender.clone(),
+                    map_sender.clone(),
                     err_sender.clone(),
                     shutdown_signal.clone(),
                 ));
             }
 
-            handles.spawn($crate::reduce(
-                reducer,
+            let (commit_sender, commit_receiver) = crate::processing_strategy!(
+                @reducers,
+                ($reduce_first $(,$reduce_rest)*),
                 reduce_receiver,
-                commit_sender.clone(),
-                err_sender.clone(),
-                shutdown_signal.clone(),
-            ));
-
-            handles.spawn($crate::reduce_err(
-                err_reducer,
-                err_receiver,
-                commit_sender.clone(),
-                shutdown_signal.clone(),
-            ));
+                err_sender,
+                shutdown_signal,
+                handles,
+            );
 
             handles.spawn($crate::commit(
                 commit_receiver,
                 consumer.clone(),
                 rendezvous_sender,
+            ));
+
+            handles.spawn($crate::reduce_err(
+                $reduce_err,
+                err_receiver,
+                commit_sender.clone(),
+                shutdown_signal.clone(),
             ));
 
             tracing::debug!("Creating actors took {:?}", start.elapsed());
