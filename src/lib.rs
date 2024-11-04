@@ -806,7 +806,7 @@ mod tests {
 
     use crate::{
         commit, map, reduce, reduce_err, CommitClient, KafkaMessage, MessageQueue, ReduceConfig,
-        ReduceShutdownBehaviour, ReduceShutdownCondition, Reducer,
+        ReduceShutdownBehaviour, ReduceShutdownCondition, Reducer, ReducerWhenFullBehaviour,
     };
 
     struct MockCommitClient {
@@ -877,7 +877,7 @@ mod tests {
             ReduceConfig {
                 shutdown_condition: ReduceShutdownCondition::Signal,
                 shutdown_behaviour: ReduceShutdownBehaviour::Drop,
-                when_full_behaviour: crate::ReducerWhenFullBehaviour::Flush,
+                when_full_behaviour: ReducerWhenFullBehaviour::Flush,
                 flush_interval: None,
             }
         }
@@ -959,11 +959,11 @@ mod tests {
             self.buffer.read().unwrap().len() >= 32
         }
 
-        fn get_reduce_config(&self) -> crate::ReduceConfig {
+        fn get_reduce_config(&self) -> ReduceConfig {
             ReduceConfig {
                 shutdown_condition: self.shutdown_condition,
                 shutdown_behaviour: ReduceShutdownBehaviour::Flush,
-                when_full_behaviour: crate::ReducerWhenFullBehaviour::Backpressure,
+                when_full_behaviour: ReducerWhenFullBehaviour::Backpressure,
                 flush_interval: Some(Duration::from_secs(1)),
             }
         }
