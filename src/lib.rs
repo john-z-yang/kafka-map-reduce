@@ -199,7 +199,7 @@ macro_rules! processing_strategy {
         $shutdown_signal:ident,
         $handles:ident,
     ) => {{
-        let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+        let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(1);
 
         $handles.spawn($crate::reduce(
             $reduce,
@@ -219,7 +219,7 @@ macro_rules! processing_strategy {
         $shutdown_signal:ident,
         $handles:ident,
     ) => {{
-        let (sender, receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
 
         $handles.spawn($crate::reduce(
             $reduce_first,
@@ -255,7 +255,7 @@ macro_rules! processing_strategy {
 
             let (rendezvous_sender, rendezvous_receiver) = tokio::sync::oneshot::channel();
 
-            const CHANNEL_BUFF_SIZE: usize = 128;
+            const CHANNEL_BUFF_SIZE: usize = 1024;
             let (map_sender, reduce_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
             let (err_sender, err_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
 
