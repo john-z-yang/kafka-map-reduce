@@ -273,7 +273,7 @@ macro_rules! processing_strategy {
                 ));
             }
 
-            let (commit_sender, commit_receiver) = crate::processing_strategy!(
+            let (commit_sender, commit_receiver) = $crate::processing_strategy!(
                 @reducers,
                 ($reduce_first $(,$reduce_rest)*),
                 reduce_receiver,
