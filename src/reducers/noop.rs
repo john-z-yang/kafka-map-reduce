@@ -23,7 +23,7 @@ impl<T> NoopReducer<T> {
 
 impl<T> Reducer for NoopReducer<T>
 where
-    T: Send,
+    T: Send + Sync,
 {
     type Input = T;
     type Output = ();
@@ -39,7 +39,7 @@ where
 
     fn reset(&mut self) {}
 
-    fn is_full(&self) -> bool {
+    async fn is_full(&self) -> bool {
         false
     }
 

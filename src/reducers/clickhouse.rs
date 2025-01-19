@@ -139,7 +139,7 @@ impl Reducer for ClickhouseBatchWriter {
         self.write_handle.take();
     }
 
-    fn is_full(&self) -> bool {
+    async fn is_full(&self) -> bool {
         self.write_handle.as_ref().is_some_and(WriteHandle::is_full)
     }
 

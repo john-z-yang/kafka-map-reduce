@@ -5,7 +5,8 @@ use futures::{
 };
 use rdkafka::{
     consumer::{
-        stream_consumer::StreamPartitionQueue, Consumer, ConsumerContext, Rebalance, StreamConsumer,
+        stream_consumer::StreamPartitionQueue, BaseConsumer, Consumer, ConsumerContext, Rebalance,
+        StreamConsumer,
     },
     error::{KafkaError, KafkaResult},
     message::{BorrowedMessage, OwnedMessage},
@@ -25,13 +26,14 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    select, signal,
+    runtime::Handle,
+    select,
     sync::{
         mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    task::JoinSet,
-    time::{self, sleep},
+    task::{self, JoinError, JoinSet},
+    time::{self, sleep, MissedTickBehavior},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::{either::Either, sync::CancellationToken};
@@ -49,9 +51,7 @@ pub async fn start_consumer(
 ) -> Result<(), Error> {
     let (client_shutdown_sender, client_shutdown_receiver) = oneshot::channel();
     let (event_sender, event_receiver) = unbounded_channel();
-
     let context = KafkaContext::new(event_sender.clone());
-
     let consumer: Arc<StreamConsumer<KafkaContext>> = Arc::new(
         kafka_client_config
             .create_with_context(context)
@@ -62,8 +62,8 @@ pub async fn start_consumer(
         .subscribe(topics)
         .expect("Can't subscribe to specified topics");
 
-    handle_os_signals(event_sender.clone());
-    handle_consumer_client(consumer.clone(), client_shutdown_receiver);
+    handle_shutdown_signals(event_sender.clone());
+    poll_consumer_client(consumer.clone(), client_shutdown_receiver);
     handle_events(
         consumer,
         event_receiver,
@@ -73,32 +73,36 @@ pub async fn start_consumer(
     .await
 }
 
-pub fn handle_os_signals(event_sender: UnboundedSender<(Event, SyncSender<()>)>) {
+pub fn handle_shutdown_signals(event_sender: UnboundedSender<(Event, SyncSender<()>)>) {
+    let guard = elegant_departure::get_shutdown_guard();
     tokio::spawn(async move {
-        let _ = signal::ctrl_c().await;
-        let (rendezvous_sender, rendezvous_receiver) = sync_channel(0);
+        let _ = guard.wait().await;
+        info!("Cancellation token received, shutting down consumer...");
+        let (rendezvous_sender, _) = sync_channel(0);
         let _ = event_sender.send((Event::Shutdown, rendezvous_sender));
-        let _ = rendezvous_receiver.recv();
     });
 }
 
-#[instrument(skip(consumer, shutdown))]
-pub fn handle_consumer_client(
+#[instrument(skip_all)]
+pub fn poll_consumer_client(
     consumer: Arc<StreamConsumer<KafkaContext>>,
     shutdown: oneshot::Receiver<()>,
 ) {
-    tokio::spawn(async move {
-        select! {
-            biased;
-            _ = shutdown => {
-                debug!("Received shutdown signal, commiting state in sync mode...");
-                let _ = consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync);
+    task::spawn_blocking(|| {
+        Handle::current().block_on(async move {
+            let _guard = elegant_departure::get_shutdown_guard().shutdown_on_drop();
+            select! {
+                biased;
+                _ = shutdown => {
+                    debug!("Received shutdown signal, commiting state in sync mode...");
+                    let _ = consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync);
+                }
+                msg = consumer.recv() => {
+                    error!("Got unexpected message from consumer client: {:?}", msg);
+                }
             }
-            _ = consumer.recv() => {
-                panic!("We're cooked");
-            }
-        }
-        debug!("Shutdown complete");
+            debug!("Shutdown complete");
+        });
     });
 }
 
@@ -116,8 +120,8 @@ impl KafkaContext {
 impl ClientContext for KafkaContext {}
 
 impl ConsumerContext for KafkaContext {
-    #[instrument(skip(self, rebalance))]
-    fn pre_rebalance(&self, rebalance: &Rebalance) {
+    #[instrument(skip_all)]
+    fn pre_rebalance(&self, _: &BaseConsumer<Self>, rebalance: &Rebalance) {
         let (rendezvous_sender, rendezvous_receiver) = sync_channel(0);
         match rebalance {
             Rebalance::Assign(tpl) => {
@@ -126,7 +130,7 @@ impl ConsumerContext for KafkaContext {
                     Event::Assign(tpl.to_topic_map().keys().cloned().collect()),
                     rendezvous_sender,
                 ));
-                info!("Parition assignment event sent, waiting for rendezvous...");
+                info!("Partition assignment event sent, waiting for rendezvous...");
                 let _ = rendezvous_receiver.recv();
                 info!("Rendezvous complete");
             }
@@ -136,7 +140,7 @@ impl ConsumerContext for KafkaContext {
                     Event::Revoke(tpl.to_topic_map().keys().cloned().collect()),
                     rendezvous_sender,
                 ));
-                info!("Parition assignment event sent, waiting for rendezvous...");
+                info!("Partition assignment event sent, waiting for rendezvous...");
                 let _ = rendezvous_receiver.recv();
                 info!("Rendezvous complete");
             }
@@ -176,7 +180,7 @@ impl ActorHandles {
 
         select! {
             _ = self.rendezvous => {
-                info!("Rendezvous complete within callback deadline.");
+                info!("Rendezvous complete within callback deadline");
             }
             _ = sleep(deadline) => {
                 error!(
@@ -186,6 +190,10 @@ impl ActorHandles {
                 self.join_set.abort_all();
             }
         }
+    }
+
+    async fn join_next(&mut self) -> Option<Result<Result<(), Error>, JoinError>> {
+        self.join_set.join_next().await
     }
 }
 
@@ -240,7 +248,7 @@ macro_rules! processing_strategy {
     }};
     (
         {
-            map: $map_fn:ident,
+            map: $map_fn:expr,
             reduce: $reduce_first:expr $(=> $reduce_rest:expr)*,
             err: $reduce_err:expr,
         }
@@ -251,7 +259,7 @@ macro_rules! processing_strategy {
             let start = std::time::Instant::now();
 
             let mut handles = tokio::task::JoinSet::new();
-            let mut shutdown_signal = tokio_util::sync::CancellationToken::new();
+            let shutdown_signal = tokio_util::sync::CancellationToken::new();
 
             let (rendezvous_sender, rendezvous_receiver) = tokio::sync::oneshot::channel();
 
@@ -262,7 +270,7 @@ macro_rules! processing_strategy {
             for (topic, partition) in tpl.iter() {
                 let queue = consumer
                     .split_partition_queue(topic, *partition)
-                    .expect("Topic and parition should always be splittable");
+                    .expect("Unable to split topic by Partition");
 
                 handles.spawn($crate::map(
                     queue,
@@ -313,7 +321,7 @@ enum ConsumerState {
     Stopped,
 }
 
-#[instrument(skip(consumer, events, shutdown_client, spawn_actors))]
+#[instrument(skip_all)]
 pub async fn handle_events(
     consumer: Arc<StreamConsumer<KafkaContext>>,
     events: UnboundedReceiver<(Event, SyncSender<()>)>,
@@ -323,61 +331,58 @@ pub async fn handle_events(
         &BTreeSet<(String, i32)>,
     ) -> ActorHandles,
 ) -> Result<(), anyhow::Error> {
-    const CALLBACK_DURATION: Duration = Duration::from_secs(1);
+    const CALLBACK_DURATION: Duration = Duration::from_secs(4);
 
+    let _guard = elegant_departure::get_shutdown_guard().shutdown_on_drop();
     let mut shutdown_client = Some(shutdown_client);
     let mut events_stream = UnboundedReceiverStream::new(events);
 
     let mut state = ConsumerState::Ready;
 
     while let ConsumerState::Ready { .. } | ConsumerState::Consuming { .. } = state {
-        let Some((event, _rendezvous_guard)) = events_stream.next().await else {
-            unreachable!("Unexpected end to event stream")
-        };
-        info!("Recieved event: {:?}", event);
-        state = match (state, event) {
-            (ConsumerState::Ready, Event::Assign(tpl)) => {
-                ConsumerState::Consuming(spawn_actors(consumer.clone(), &tpl), tpl)
+        select! {
+            res = match state {
+                ConsumerState::Consuming(ref mut handles, _) => Either::Left(handles.join_next()),
+                _ => Either::Right(future::pending::<_>()),
+            } => {
+                error!("Actor exited unexpectedly with {:?}, shutting down...", res);
+                drop(elegant_departure::shutdown());
             }
-            (ConsumerState::Ready, Event::Revoke(_)) => {
-                unreachable!("Got partition revocation before the consumer has started")
-            }
-            (ConsumerState::Ready, Event::Shutdown) => ConsumerState::Stopped,
-            (ConsumerState::Consuming(actor_handles, mut tpl), Event::Assign(mut assigned_tpl)) => {
-                assert!(
-                    tpl.is_disjoint(&assigned_tpl),
-                    "Newly assigned TPL should be disjoint from TPL we're consuming from"
-                );
-                tpl.append(&mut assigned_tpl);
-                debug!(
-                    "{} additional topic partitions added after assignment",
-                    assigned_tpl.len()
-                );
-                actor_handles.shutdown(CALLBACK_DURATION).await;
-                ConsumerState::Consuming(spawn_actors(consumer.clone(), &tpl), tpl)
-            }
-            (ConsumerState::Consuming(actor_handles, mut tpl), Event::Revoke(revoked_tpl)) => {
-                assert!(
-                    tpl.is_subset(&revoked_tpl),
-                    "Revoked TPL should be a subset of TPL we're consuming from"
-                );
-                tpl.retain(|e| !revoked_tpl.contains(e));
-                debug!("{} topic partitions remaining after revocation", tpl.len());
-                actor_handles.shutdown(CALLBACK_DURATION).await;
-                if tpl.is_empty() {
-                    ConsumerState::Ready
-                } else {
-                    ConsumerState::Consuming(spawn_actors(consumer.clone(), &tpl), tpl)
+
+            event = events_stream.next() => {
+                let Some((event, _rendezvous_guard)) = event else {
+                    unreachable!("Unexpected end to event stream");
+                };
+                info!("Received event: {:?}", event);
+                state = match (state, event) {
+                    (ConsumerState::Ready, Event::Assign(tpl)) => {
+                        ConsumerState::Consuming(spawn_actors(consumer.clone(), &tpl), tpl)
+                    }
+                    (ConsumerState::Ready, Event::Revoke(_)) => {
+                        unreachable!("Got partition revocation before the consumer has started")
+                    }
+                    (ConsumerState::Ready, Event::Shutdown) => ConsumerState::Stopped,
+                    (ConsumerState::Consuming(_, _), Event::Assign(_)) => {
+                        unreachable!("Got partition assignment after the consumer has started")
+                    }
+                    (ConsumerState::Consuming(handles, tpl), Event::Revoke(revoked)) => {
+                        assert!(
+                            tpl == revoked,
+                            "Revoked TPL should be equal to the subset of TPL we're consuming from"
+                        );
+                        handles.shutdown(CALLBACK_DURATION).await;
+                        ConsumerState::Ready
+                    }
+                    (ConsumerState::Consuming(handles, _), Event::Shutdown) => {
+                        handles.shutdown(CALLBACK_DURATION).await;
+                        debug!("Signaling shutdown to client...");
+                        shutdown_client.take();
+                        ConsumerState::Stopped
+                    }
+                    (ConsumerState::Stopped, _) => {
+                        unreachable!("Got event after consumer has stopped")
+                    }
                 }
-            }
-            (ConsumerState::Consuming(actor_handles, _), Event::Shutdown) => {
-                actor_handles.shutdown(CALLBACK_DURATION).await;
-                debug!("Signaling shutdown to client...");
-                shutdown_client.take();
-                ConsumerState::Stopped
-            }
-            (ConsumerState::Stopped, _) => {
-                unreachable!("Got event after consumer has stopped")
             }
         }
     }
@@ -411,7 +416,7 @@ impl MessageQueue for StreamPartitionQueue<KafkaContext> {
     }
 }
 
-#[instrument(skip(queue, transform, ok, err, shutdown))]
+#[instrument(skip_all)]
 pub async fn map<T, F>(
     queue: impl MessageQueue,
     transform: impl Fn(Arc<OwnedMessage>) -> F,
@@ -430,6 +435,7 @@ where
             biased;
 
             _ = shutdown.cancelled() => {
+                debug!("Receive shutdown signal, shutting down...");
                 break;
             }
 
@@ -440,12 +446,16 @@ where
                 let msg = Arc::new(msg.detach()?);
                 match transform(msg.clone()).await {
                     Ok(transformed) => {
-                        ok.send((
-                            iter::once(Arc::try_unwrap(msg).expect("msg should only have a single strong ref")),
+                        if ok.send((
+                            iter::once(
+                                Arc::try_unwrap(msg)
+                                    .expect("msg should only have a single strong ref"),
+                            ),
                             transformed,
-                        ))
-                        .await
-                        .map_err(|err| anyhow!("{}", err))?;
+                        )).await.is_err() {
+                            debug!("Receive half of ok channel is closed, shutting down...");
+                            break;
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -460,7 +470,7 @@ where
                             Arc::try_unwrap(msg).expect("msg should only have a single strong ref"),
                         )
                         .await
-                        .expect("reduce_err should always be available");
+                        .expect("reduce_err is not available");
                     }
                 }
             }
@@ -503,7 +513,7 @@ pub trait Reducer {
     fn reduce(&mut self, t: Self::Input) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
     fn flush(&mut self) -> impl Future<Output = Result<Self::Output, anyhow::Error>> + Send;
     fn reset(&mut self);
-    fn is_full(&self) -> bool;
+    fn is_full(&self) -> impl Future<Output = bool> + Send;
     fn get_reduce_config(&self) -> ReduceConfig;
 }
 
@@ -513,14 +523,12 @@ async fn handle_reducer_failure<T>(
     err: &mpsc::Sender<OwnedMessage>,
 ) {
     for msg in take(inflight_msgs).into_iter() {
-        err.send(msg)
-            .await
-            .expect("reduce_err should always be available");
+        err.send(msg).await.expect("reduce_err is not available");
     }
     reducer.reset();
 }
 
-#[instrument(skip(reducer, inflight_msgs, ok, err))]
+#[instrument(skip_all)]
 async fn flush_reducer<T, U>(
     reducer: &mut impl Reducer<Input = T, Output = U>,
     inflight_msgs: &mut Vec<OwnedMessage>,
@@ -543,7 +551,7 @@ async fn flush_reducer<T, U>(
     Ok(())
 }
 
-#[instrument(skip(reducer, receiver, ok, err, shutdown))]
+#[instrument(skip_all)]
 pub async fn reduce<T, U>(
     mut reducer: impl Reducer<Input = T, Output = U>,
     mut receiver: mpsc::Receiver<(impl IntoIterator<Item = OwnedMessage>, T)>,
@@ -553,6 +561,8 @@ pub async fn reduce<T, U>(
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
     let mut flush_timer = config.flush_interval.map(time::interval);
+    let mut repoll_timer = time::interval(Duration::from_secs(1));
+    repoll_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut inflight_msgs = Vec::new();
 
     loop {
@@ -585,7 +595,7 @@ pub async fn reduce<T, U>(
                 flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
             }
 
-            val = receiver.recv(), if !reducer.is_full() => {
+            val = receiver.recv(), if !reducer.is_full().await => {
                 let Some((msg, value)) = val else {
                     assert_eq!(
                         config.shutdown_condition,
@@ -620,11 +630,13 @@ pub async fn reduce<T, U>(
                 }
 
                 if config.when_full_behaviour == ReducerWhenFullBehaviour::Flush
-                    && reducer.is_full()
+                    && reducer.is_full().await
                 {
                     flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
                 }
             }
+
+            _ = repoll_timer.tick() => { }
         }
     }
 
@@ -632,7 +644,7 @@ pub async fn reduce<T, U>(
     Ok(())
 }
 
-#[instrument(skip(reducer, receiver, ok, shutdown))]
+#[instrument(skip_all)]
 pub async fn reduce_err(
     mut reducer: impl Reducer<Input = OwnedMessage, Output = ()>,
     mut receiver: mpsc::Receiver<OwnedMessage>,
@@ -654,7 +666,7 @@ pub async fn reduce_err(
                         reducer
                             .flush()
                             .await
-                            .expect("error reducer flush should always be successful");
+                            .expect("Failed to flush error reducer");
                         if !inflight_msgs.is_empty() {
                             ok.send((take(&mut inflight_msgs), ()))
                                 .await
@@ -677,7 +689,7 @@ pub async fn reduce_err(
                 reducer
                     .flush()
                     .await
-                    .expect("error reducer flush should always be successful");
+                    .expect("Failed to flush error reducer");
                 if !inflight_msgs.is_empty() {
                     ok.send((take(&mut inflight_msgs), ()))
                         .await
@@ -685,7 +697,7 @@ pub async fn reduce_err(
                 }
             }
 
-            val = receiver.recv(), if !reducer.is_full() => {
+            val = receiver.recv(), if !reducer.is_full().await => {
                 let Some(msg) = val else {
                     unreachable!("Received end of stream without shutdown signal");
                 };
@@ -694,15 +706,15 @@ pub async fn reduce_err(
                 reducer
                     .reduce(msg)
                     .await
-                    .expect("error reducer reduce should always be successful");
+                    .expect("Failed to reduce error reducer");
 
                 if matches!(config.when_full_behaviour, ReducerWhenFullBehaviour::Flush)
-                    && reducer.is_full()
+                    && reducer.is_full().await
                 {
                     reducer
                         .flush()
                         .await
-                        .expect("error reducer flush should always be successful");
+                        .expect("Failed to flush error reducer");
 
                     if !inflight_msgs.is_empty() {
                         ok.send((take(&mut inflight_msgs), ()))
@@ -758,20 +770,19 @@ impl From<HighwaterMark> for TopicPartitionList {
         let mut tpl = TopicPartitionList::with_capacity(val.len());
         for ((topic, partition), offset) in val.data.iter() {
             tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset))
-                .expect("Partition offset should always be valid");
+                .expect("Invalid partition offset");
         }
         tpl
     }
 }
 
-#[instrument(skip(receiver, consumer, _rendezvous_guard))]
+#[instrument(skip_all)]
 pub async fn commit(
     mut receiver: mpsc::Receiver<(Vec<OwnedMessage>, ())>,
     consumer: Arc<impl CommitClient>,
     _rendezvous_guard: oneshot::Sender<()>,
 ) -> Result<(), Error> {
     while let Some(msgs) = receiver.recv().await {
-        debug!("Storing offsets");
         let mut highwater_mark = HighwaterMark::new();
         msgs.0.iter().for_each(|msg| highwater_mark.track(msg));
         consumer.store_offsets(&highwater_mark.into()).unwrap();
@@ -869,7 +880,7 @@ mod tests {
             self.data.take();
         }
 
-        fn is_full(&self) -> bool {
+        async fn is_full(&self) -> bool {
             self.data.is_some()
         }
 
@@ -955,7 +966,7 @@ mod tests {
             self.buffer.write().unwrap().clear();
         }
 
-        fn is_full(&self) -> bool {
+        async fn is_full(&self) -> bool {
             self.buffer.read().unwrap().len() >= 32
         }
 
