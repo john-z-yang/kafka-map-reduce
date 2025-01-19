@@ -140,9 +140,7 @@ impl Reducer for ClickhouseBatchWriter {
     }
 
     fn is_full(&self) -> bool {
-        self.write_handle
-            .as_ref()
-            .map_or(false, WriteHandle::is_full)
+        self.write_handle.as_ref().is_some_and(WriteHandle::is_full)
     }
 
     fn get_reduce_config(&self) -> ReduceConfig {
