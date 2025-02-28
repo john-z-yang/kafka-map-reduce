@@ -23,7 +23,7 @@ impl<T> NoopReducer<T> {
 
 impl<T> Reducer for NoopReducer<T>
 where
-    T: Send,
+    T: Send + Sync,
 {
     type Input = T;
     type Output = ();
@@ -32,14 +32,14 @@ where
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<(), anyhow::Error> {
+    async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
         info!("Noop reducer id: {} flushed", self.id);
-        Ok(())
+        Ok(Some(()))
     }
 
     fn reset(&mut self) {}
 
-    fn is_full(&self) -> bool {
+    async fn is_full(&self) -> bool {
         false
     }
 

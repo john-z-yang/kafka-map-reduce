@@ -2,7 +2,7 @@ use crate::{
     ReduceConfig, ReduceShutdownBehaviour, ReduceShutdownCondition, Reducer,
     ReducerWhenFullBehaviour,
 };
-use anyhow::{anyhow, Error, Ok};
+use anyhow::{Error, Ok, anyhow};
 use reqwest::{Client, Response};
 use std::{collections::HashMap, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -111,9 +111,9 @@ impl Reducer for ClickhouseBatchWriter {
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<(), anyhow::Error> {
+    async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
         if self.write_handle.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let res = self.write_handle.take().unwrap().flush().await??;
 
@@ -129,7 +129,7 @@ impl Reducer for ClickhouseBatchWriter {
                     .unwrap(),
                 res.headers().get("x-clickhouse-query-id").unwrap(),
             );
-            Ok(())
+            Ok(Some(()))
         } else {
             Err(anyhow!("Write failed: {:?}", res))
         }
@@ -139,8 +139,10 @@ impl Reducer for ClickhouseBatchWriter {
         self.write_handle.take();
     }
 
-    fn is_full(&self) -> bool {
-        self.write_handle.as_ref().is_some_and(WriteHandle::is_full)
+    async fn is_full(&self) -> bool {
+        self.write_handle
+            .as_ref()
+            .map_or(false, WriteHandle::is_full)
     }
 
     fn get_reduce_config(&self) -> ReduceConfig {

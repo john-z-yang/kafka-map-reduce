@@ -1,15 +1,17 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use futures::{
+    Stream, StreamExt,
     future::{self},
-    pin_mut, Stream, StreamExt,
+    pin_mut,
 };
 use rdkafka::{
+    ClientConfig, ClientContext, Message, Offset, TopicPartitionList,
     consumer::{
-        stream_consumer::StreamPartitionQueue, Consumer, ConsumerContext, Rebalance, StreamConsumer,
+        BaseConsumer, Consumer, ConsumerContext, Rebalance, StreamConsumer,
+        stream_consumer::StreamPartitionQueue,
     },
     error::{KafkaError, KafkaResult},
     message::{BorrowedMessage, OwnedMessage},
-    ClientConfig, ClientContext, Message, Offset, TopicPartitionList,
 };
 use std::{
     cmp,
@@ -19,23 +21,23 @@ use std::{
     iter,
     mem::take,
     sync::{
-        mpsc::{sync_channel, SyncSender},
         Arc,
+        mpsc::{SyncSender, sync_channel},
     },
     time::Duration,
 };
 use tokio::{
     select, signal,
     sync::{
-        mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
+        mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel},
         oneshot,
     },
     task::JoinSet,
-    time::{self, sleep},
+    time::{self, MissedTickBehavior, sleep},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::{either::Either, sync::CancellationToken};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 pub mod reducers;
 
@@ -117,11 +119,18 @@ impl ClientContext for KafkaContext {}
 
 impl ConsumerContext for KafkaContext {
     #[instrument(skip(self, rebalance))]
-    fn pre_rebalance(&self, rebalance: &Rebalance) {
+    fn pre_rebalance(&self, _: &BaseConsumer<Self>, rebalance: &Rebalance) {
         let (rendezvous_sender, rendezvous_receiver) = sync_channel(0);
         match rebalance {
             Rebalance::Assign(tpl) => {
                 debug!("Got pre-rebalance callback, kind: Assign");
+                if tpl.count() == 0 {
+                    warn!(
+                        "Got partition assignment with no partitions, \
+                        this is likely due to there being more consumers than partitions"
+                    );
+                    return;
+                }
                 let _ = self.event_sender.send((
                     Event::Assign(tpl.to_topic_map().keys().cloned().collect()),
                     rendezvous_sender,
@@ -132,6 +141,13 @@ impl ConsumerContext for KafkaContext {
             }
             Rebalance::Revoke(tpl) => {
                 debug!("Got pre-rebalance callback, kind: Revoke");
+                if tpl.count() == 0 {
+                    warn!(
+                        "Got partition revocation with no partitions, \
+                        this is likely due to there being more consumers than partitions"
+                    );
+                    return;
+                }
                 let _ = self.event_sender.send((
                     Event::Revoke(tpl.to_topic_map().keys().cloned().collect()),
                     rendezvous_sender,
@@ -240,7 +256,7 @@ macro_rules! processing_strategy {
     }};
     (
         {
-            map: $map_fn:ident,
+            map: $map_fn:expr,
             reduce: $reduce_first:expr $(=> $reduce_rest:expr)*,
             err: $reduce_err:expr,
         }
@@ -251,7 +267,7 @@ macro_rules! processing_strategy {
             let start = std::time::Instant::now();
 
             let mut handles = tokio::task::JoinSet::new();
-            let mut shutdown_signal = tokio_util::sync::CancellationToken::new();
+            let shutdown_signal = tokio_util::sync::CancellationToken::new();
 
             let (rendezvous_sender, rendezvous_receiver) = tokio::sync::oneshot::channel();
 
@@ -273,7 +289,7 @@ macro_rules! processing_strategy {
                 ));
             }
 
-            let (commit_sender, commit_receiver) = $crate::processing_strategy!(
+            let (_, commit_receiver) = $crate::processing_strategy!(
                 @reducers,
                 ($reduce_first $(,$reduce_rest)*),
                 reduce_receiver,
@@ -291,7 +307,6 @@ macro_rules! processing_strategy {
             handles.spawn($crate::reduce_err(
                 $reduce_err,
                 err_receiver,
-                commit_sender.clone(),
                 shutdown_signal.clone(),
             ));
 
@@ -411,7 +426,7 @@ impl MessageQueue for StreamPartitionQueue<KafkaContext> {
     }
 }
 
-#[instrument(skip(queue, transform, ok, err, shutdown))]
+#[instrument(skip_all)]
 pub async fn map<T, F>(
     queue: impl MessageQueue,
     transform: impl Fn(Arc<OwnedMessage>) -> F,
@@ -501,9 +516,10 @@ pub trait Reducer {
     type Output;
 
     fn reduce(&mut self, t: Self::Input) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
-    fn flush(&mut self) -> impl Future<Output = Result<Self::Output, anyhow::Error>> + Send;
+    fn flush(&mut self)
+    -> impl Future<Output = Result<Option<Self::Output>, anyhow::Error>> + Send;
     fn reset(&mut self);
-    fn is_full(&self) -> bool;
+    fn is_full(&self) -> impl Future<Output = bool> + Send;
     fn get_reduce_config(&self) -> ReduceConfig;
 }
 
@@ -532,18 +548,17 @@ async fn flush_reducer<T, U>(
             error!("Failed to flush reducer, reason: {}", e);
             handle_reducer_failure(reducer, inflight_msgs, err).await;
         }
-        Ok(result) => {
-            if !inflight_msgs.is_empty() {
-                ok.send((take(inflight_msgs), result))
-                    .await
-                    .map_err(|err| anyhow!("{}", err))?;
-            }
+        Ok(None) => {}
+        Ok(Some(result)) => {
+            ok.send((take(inflight_msgs), result))
+                .await
+                .map_err(|err| anyhow!("{}", err))?;
         }
     }
     Ok(())
 }
 
-#[instrument(skip(reducer, receiver, ok, err, shutdown))]
+#[instrument(skip_all)]
 pub async fn reduce<T, U>(
     mut reducer: impl Reducer<Input = T, Output = U>,
     mut receiver: mpsc::Receiver<(impl IntoIterator<Item = OwnedMessage>, T)>,
@@ -553,6 +568,8 @@ pub async fn reduce<T, U>(
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
     let mut flush_timer = config.flush_interval.map(time::interval);
+    let mut repoll_timer = time::interval(Duration::from_secs(1));
+    repoll_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut inflight_msgs = Vec::new();
 
     loop {
@@ -585,7 +602,7 @@ pub async fn reduce<T, U>(
                 flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
             }
 
-            val = receiver.recv(), if !reducer.is_full() => {
+            val = receiver.recv(), if !reducer.is_full().await => {
                 let Some((msg, value)) = val else {
                     assert_eq!(
                         config.shutdown_condition,
@@ -618,13 +635,14 @@ pub async fn reduce<T, U>(
                     );
                     handle_reducer_failure(&mut reducer, &mut inflight_msgs, &err).await;
                 }
-
-                if config.when_full_behaviour == ReducerWhenFullBehaviour::Flush
-                    && reducer.is_full()
-                {
-                    flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
-                }
             }
+
+            _ = repoll_timer.tick() => {}
+        }
+
+        if config.when_full_behaviour == ReducerWhenFullBehaviour::Flush && reducer.is_full().await
+        {
+            flush_reducer(&mut reducer, &mut inflight_msgs, &ok, &err).await?;
         }
     }
 
@@ -632,34 +650,33 @@ pub async fn reduce<T, U>(
     Ok(())
 }
 
-#[instrument(skip(reducer, receiver, ok, shutdown))]
+#[instrument(skip_all)]
 pub async fn reduce_err(
     mut reducer: impl Reducer<Input = OwnedMessage, Output = ()>,
     mut receiver: mpsc::Receiver<OwnedMessage>,
-    ok: mpsc::Sender<(Vec<OwnedMessage>, ())>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
     let config = reducer.get_reduce_config();
     let mut flush_timer = config.flush_interval.map(time::interval);
-    let mut inflight_msgs = Vec::new();
+    let mut repoll_timer = time::interval(Duration::from_secs(1));
+    repoll_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         select! {
             biased;
 
-            _ = shutdown.cancelled() => {
+            _ = if config.shutdown_condition == ReduceShutdownCondition::Signal {
+                Either::Left(shutdown.cancelled())
+            } else {
+                Either::Right(future::pending::<_>())
+            } => {
                 match config.shutdown_behaviour {
                     ReduceShutdownBehaviour::Flush => {
                         debug!("Received shutdown signal, flushing reducer...");
                         reducer
                             .flush()
                             .await
-                            .expect("error reducer flush should always be successful");
-                        if !inflight_msgs.is_empty() {
-                            ok.send((take(&mut inflight_msgs), ()))
-                                .await
-                                .map_err(|err| anyhow!("{}", err))?;
-                        }
+                            .expect("Failed to flush error reducer");
                     },
                     ReduceShutdownBehaviour::Drop => {
                         debug!("Received shutdown signal, dropping reducer...");
@@ -677,40 +694,47 @@ pub async fn reduce_err(
                 reducer
                     .flush()
                     .await
-                    .expect("error reducer flush should always be successful");
-                if !inflight_msgs.is_empty() {
-                    ok.send((take(&mut inflight_msgs), ()))
-                        .await
-                        .map_err(|err| anyhow!("{}", err))?;
-                }
+                    .expect("Failed to flush error reducer");
             }
 
-            val = receiver.recv(), if !reducer.is_full() => {
+            val = receiver.recv(), if !reducer.is_full().await => {
                 let Some(msg) = val else {
-                    unreachable!("Received end of stream without shutdown signal");
+                    assert_eq!(
+                        config.shutdown_condition,
+                        ReduceShutdownCondition::Drain,
+                        "Got end of stream without shutdown signal"
+                    );
+                    match config.shutdown_behaviour {
+                        ReduceShutdownBehaviour::Flush => {
+                            debug!("Received end of stream, flushing reducer...");
+                            reducer
+                                .flush()
+                                .await
+                                .expect("Failed to flush error reducer");
+                        }
+                        ReduceShutdownBehaviour::Drop => {
+                            debug!("Received end of stream, dropping reducer...");
+                            drop(reducer);
+                        }
+                    };
+                    break;
                 };
-                inflight_msgs.push(msg.clone());
 
                 reducer
                     .reduce(msg)
                     .await
-                    .expect("error reducer reduce should always be successful");
-
-                if matches!(config.when_full_behaviour, ReducerWhenFullBehaviour::Flush)
-                    && reducer.is_full()
-                {
-                    reducer
-                        .flush()
-                        .await
-                        .expect("error reducer flush should always be successful");
-
-                    if !inflight_msgs.is_empty() {
-                        ok.send((take(&mut inflight_msgs), ()))
-                            .await
-                            .map_err(|err| anyhow!("{}", err))?;
-                    }
-                }
+                    .expect("Failed to reduce error reducer");
             }
+
+            _ = repoll_timer.tick() => {}
+        }
+
+        if config.when_full_behaviour == ReducerWhenFullBehaviour::Flush && reducer.is_full().await
+        {
+            reducer
+                .flush()
+                .await
+                .expect("Failed to flush error reducer");
         }
     }
 
@@ -785,28 +809,31 @@ mod tests {
     use std::{
         collections::HashMap,
         iter,
+        marker::PhantomData,
         mem::take,
         sync::{Arc, RwLock},
         time::Duration,
     };
 
-    use anyhow::{anyhow, Error};
+    use anyhow::{Error, anyhow};
     use futures::Stream;
     use rdkafka::{
+        Message, Offset, Timestamp, TopicPartitionList,
         error::{KafkaError, KafkaResult},
         message::OwnedMessage,
-        Message, Offset, Timestamp, TopicPartitionList,
     };
     use tokio::{
         sync::{broadcast, mpsc, oneshot},
         time::sleep,
     };
-    use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+    use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        commit, map, reduce, reduce_err, CommitClient, KafkaMessage, MessageQueue, ReduceConfig,
-        ReduceShutdownBehaviour, ReduceShutdownCondition, Reducer, ReducerWhenFullBehaviour,
+        CommitClient, KafkaMessage, MessageQueue, ReduceConfig, ReduceShutdownBehaviour,
+        ReduceShutdownCondition, Reducer, ReducerWhenFullBehaviour, commit, map,
+        processing_strategy, reduce, reduce_err, reducers::os_stream::OsStream,
+        reducers::os_stream::OsStreamWriter,
     };
 
     struct MockCommitClient {
@@ -860,16 +887,19 @@ mod tests {
             Ok(())
         }
 
-        async fn flush(&mut self) -> Result<(), anyhow::Error> {
+        async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
+            if self.data.is_none() {
+                return Ok(None);
+            }
             self.pipe.write().unwrap().push(self.data.take().unwrap());
-            Ok(())
+            Ok(Some(()))
         }
 
         fn reset(&mut self) {
             self.data.take();
         }
 
-        fn is_full(&self) -> bool {
+        async fn is_full(&self) -> bool {
             self.data.is_some()
         }
 
@@ -935,7 +965,7 @@ mod tests {
             Ok(())
         }
 
-        async fn flush(&mut self) -> Result<(), anyhow::Error> {
+        async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
             if let Some(idx) = self.error_on_nth_flush {
                 if idx == 0 {
                     self.error_on_nth_flush.take();
@@ -944,18 +974,21 @@ mod tests {
                     self.error_on_nth_flush = Some(idx - 1);
                 }
             }
+            if self.buffer.read().unwrap().is_empty() {
+                return Ok(None);
+            }
             self.pipe
                 .write()
                 .unwrap()
                 .extend(take(&mut self.buffer.write().unwrap() as &mut Vec<T>).into_iter());
-            Ok(())
+            Ok(Some(()))
         }
 
         fn reset(&mut self) {
             self.buffer.write().unwrap().clear();
         }
 
-        fn is_full(&self) -> bool {
+        async fn is_full(&self) -> bool {
             self.buffer.read().unwrap().len() >= 32
         }
 
@@ -1024,7 +1057,6 @@ mod tests {
         let pipe = reducer.get_pipe();
 
         let (sender, receiver) = mpsc::channel(1);
-        let (commit_sender, mut commit_receiver) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
 
         let msg = OwnedMessage::new(
@@ -1037,18 +1069,10 @@ mod tests {
             None,
         );
 
-        tokio::spawn(reduce_err(
-            reducer,
-            receiver,
-            commit_sender,
-            shutdown.clone(),
-        ));
+        tokio::spawn(reduce_err(reducer, receiver, shutdown.clone()));
 
         assert!(sender.send(msg.clone()).await.is_ok());
-        assert_eq!(
-            commit_receiver.recv().await.unwrap().0[0].payload(),
-            msg.payload()
-        );
+        sleep(Duration::from_secs(1)).await;
         assert_eq!(
             pipe.read().unwrap().last().unwrap().payload().unwrap(),
             &[0, 1, 2, 3, 4, 5, 6, 7]
@@ -1056,9 +1080,6 @@ mod tests {
 
         drop(sender);
         shutdown.cancel();
-
-        sleep(Duration::from_secs(1)).await;
-        assert!(commit_receiver.is_closed());
     }
 
     #[tokio::test]
@@ -1205,7 +1226,6 @@ mod tests {
         let pipe = reducer.get_pipe();
 
         let (sender, receiver) = mpsc::channel(1);
-        let (commit_sender, mut commit_receiver) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
 
         let msg = OwnedMessage::new(
@@ -1218,26 +1238,15 @@ mod tests {
             None,
         );
 
-        tokio::spawn(reduce_err(
-            reducer,
-            receiver,
-            commit_sender,
-            shutdown.clone(),
-        ));
+        tokio::spawn(reduce_err(reducer, receiver, shutdown.clone()));
 
         assert!(sender.send(msg.clone()).await.is_ok());
-        assert_eq!(
-            commit_receiver.recv().await.unwrap().0[0].payload(),
-            msg.payload()
-        );
+        sleep(Duration::from_secs(1)).await;
         assert_eq!(pipe.read().unwrap()[0].payload(), msg.payload());
         assert!(buffer.read().unwrap().is_empty());
 
         drop(sender);
         shutdown.cancel();
-
-        sleep(Duration::from_secs(1)).await;
-        assert!(commit_receiver.is_closed());
     }
 
     #[tokio::test]
@@ -1754,5 +1763,78 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         assert!(ok_receiver.is_closed());
         assert!(err_receiver.is_closed());
+    }
+
+    pub struct NoopReducer<T> {
+        phantom: PhantomData<T>,
+    }
+
+    impl<T> NoopReducer<T> {
+        pub fn new() -> Self {
+            Self {
+                phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<T> Reducer for NoopReducer<T>
+    where
+        T: Send + Sync,
+    {
+        type Input = T;
+        type Output = ();
+
+        async fn reduce(&mut self, _t: Self::Input) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
+            Ok(Some(()))
+        }
+
+        fn reset(&mut self) {}
+
+        async fn is_full(&self) -> bool {
+            false
+        }
+
+        fn get_reduce_config(&self) -> ReduceConfig {
+            ReduceConfig {
+                shutdown_condition: ReduceShutdownCondition::Drain,
+                shutdown_behaviour: ReduceShutdownBehaviour::Flush,
+                when_full_behaviour: ReducerWhenFullBehaviour::Flush,
+                flush_interval: Some(Duration::from_secs(1)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_processing_strategy_can_compile() {
+        let _ = processing_strategy!({
+            map:
+                |_: Arc<OwnedMessage>| async move { Ok(()) },
+            reduce:
+                NoopReducer::new()
+                => NoopReducer::new()
+                => NoopReducer::new()
+                => NoopReducer::new(),
+            err:
+                OsStreamWriter::new(
+                    Duration::from_secs(1),
+                    OsStream::StdErr,
+                ),
+        });
+
+        let _ = processing_strategy!({
+            map:
+                |_: Arc<OwnedMessage>| async move { Ok(()) },
+            reduce:
+                NoopReducer::new(),
+            err:
+                OsStreamWriter::new(
+                    Duration::from_secs(1),
+                    OsStream::StdErr,
+                ),
+        });
     }
 }

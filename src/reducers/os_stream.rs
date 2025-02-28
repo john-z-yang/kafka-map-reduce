@@ -30,7 +30,7 @@ impl<T> OsStreamWriter<T> {
 
 impl<T> Reducer for OsStreamWriter<T>
 where
-    T: Debug + Send,
+    T: Debug + Send + Sync,
 {
     type Input = T;
     type Output = ();
@@ -40,23 +40,23 @@ where
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<(), anyhow::Error> {
+    async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
         let Some(data) = self.data.take() else {
-            return Ok(());
+            return Ok(None);
         };
         match self.os_stream {
             OsStream::StdOut => println!("{:?}", data),
             OsStream::StdErr => eprintln!("{:?}", data),
         }
         sleep(self.print_duration).await;
-        Ok(())
+        Ok(Some(()))
     }
 
     fn reset(&mut self) {
         self.data.take();
     }
 
-    fn is_full(&self) -> bool {
+    async fn is_full(&self) -> bool {
         self.data.is_some()
     }
 

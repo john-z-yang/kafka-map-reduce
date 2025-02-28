@@ -1,12 +1,12 @@
 [package]
 name = "kafka-map-reduce"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rdkafka = { version = "0.36.2", features = ["cmake-build"] }
+rdkafka = { version = "0.37.0", features = ["cmake-build"] }
 tokio = { version = "1.41.0", features = ["full"] }
 tokio-util = "0.7.12"
 tokio-stream = { version = "0.1.16", features = ["full"] }
