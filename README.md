@@ -1,8 +1,13 @@
 # kafka-map-reduce
 
-A simple toy kafka consumer framework implementation in Rust. Build on top of [Tokio](https://tokio.rs/) and [rdkafka](https://docs.rs/rdkafka/latest/rdkafka/index.html)'s [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/stream_consumer/struct.StreamConsumer.html) to be fully asynchronous. Most techniques are stolen from [Vector](https://vector.dev/) and [Arroyo](https://github.com/getsentry/arroyo).
+A simple toy kafka consumer framework implementation in Rust. Built on top of [Tokio](https://tokio.rs/) and [rdkafka](https://docs.rs/rdkafka/latest/rdkafka/index.html)'s [StreamConsumer](https://docs.rs/rdkafka/latest/rdkafka/consumer/stream_consumer/struct.StreamConsumer.html) to be fully asynchronous. Most techniques are stolen from [Vector](https://vector.dev/) and [Arroyo](https://github.com/getsentry/arroyo).
 
-It processes the messages from Kafka in 2 phases: a map phase and a reduce phase. The map phase runs completely in parallel on each partition the consumer is assigned to. The reduce phase runs in sequence and performs some operations over all output of the map phase within a period of time or number of messages. There can be one or more reduce steps.
+There are 4 kinds of processing stages provided by the `processing_strategy` macro. The first 2, map and reduce, can be arranged in any arbitrary pre-defined order. The latter 2, `par_map` and `err` can only be defined once.
+
+1. **map**: 1 → 1 transformation that runs concurrently.
+2. **reduce**: N → 1 transformation that runs concurrently.
+3. **par_map**: 1 → 1 transformation is defined once at the beginning of the `processing_strategy`. It will be run in *parallel* on each messages as n separate tokio tasks with n being the number of partitions assigned to the consumer.
+4. **err**: N → 1 transformation is defined once at the beginning of the `processing_strategy`. It will be recieve all the *original* kafka messages when any processing stage returned an `anyhow::Error` instead of `Ok(T)`.
 
 ## Demo
 
@@ -31,22 +36,23 @@ async fn main() -> Result<(), Error> {
             .set("enable.auto.offset.store", "false")
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
-            map: parse,
+            err: OsStreamWriter::new(
+                Duration::from_secs(1),
+                OsStream::StdErr,
+            ),
+
+            par_map: parse,
             reduce: ClickhouseBatchWriter::new(
                 host,
                 port,
                 table,
                 128,
-                Duration::from_secs(4),
+                Duration::from_secs(2),
                 ReduceShutdownBehaviour::Flush,
-            )
-            // Some arbiary number of reduce steps
-            => NoopReducer::new("Hello")
-            => NoopReducer::new("World"),
-            err: OsStreamWriter::new(
-                Duration::from_secs(1),
-                OsStream::StdErr,
             ),
+            map: ClickhouseAckHandler{
+                concurrency: 1,
+            },
         }),
     )
     .await
@@ -113,36 +119,46 @@ Identical to [Vector](https://vector.dev/docs/about/under-the-hood/architecture/
 ### Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                     ┌──────────┐                                             │
-│                            ┌───────────SIG─────────►│Reduce Err├──OFF───────────────────────────────────┐    │
-│                            │                        └──────────┘                                        │    │
-│                            │                           ▲   ▲                                            │    │
-│    ┌──────────┐            │                           │   │                                            │    │
-│    │OS signals│───SIG──┐   │                    ┌─MSG──┤  MSG────────────┬─────────────┐                │    │
-│    └──────────┘        │   │                    │      │   │             │             │                │    │
-│                        ▼   │                    │      ▼   │             │             │                ▼    │
-│                   ┌────────┴────┐               │     ┌────┴───┐         │         ┌───┴────┐        ┌──────┐│
-└─────SIG──────────►│Event Handler│──────SIG──────┼────►│Reduce_0│──MSG──►...──MSG──►│Reduce_m│──OFF──►│Commit│┘
-                    └────────┬────┘               │     └────────┘                   └────────┘        └──────┘ 
-                         ▲   │                    │                                                             
-┌───────────────┐        │   │   ┌─────────────┐  │                                                             
-│Consumer client│◄──SIG──┘  SIG  │Map          │  │                                                             
-└───────────────┘            │   │┌───────────┐│  │                                                             
-                             ├───┤│Partition_0│├──┤                                                             
-                             │   │└───────────┘│  │                                                             
-                             │   └─────────────┘  │                                                             
-                             │          .         │                                                             
-                             │          .         │                                                             
-                             │          .         │                                                             
-                             │   ┌─────────────┐  │                                                             
-                             │   │Map          │  │                                                             
-                             │   │┌───────────┐│  │                                                             
-                             └───┤│Partition_n│├──┘                                                             
-                                 │└───────────┘│                                                                
-                                 └─────────────┘                                                                
-                                                                                                                
-┌───────────────────────────────────────────┐                                                                   
-│ SIG: Signals  MSG: Messages  OFF: Offsets │                                                                   
-└───────────────────────────────────────────┘                                                                   
+┌───────────────────────────────────────────┐                                                       
+│ SIG: Signals  MSG: Messages  OFF: Offsets │                                                       
+└───────────────────────────────────────────┘                                                       
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  consumer                                                                                        │
+│  ┌──────────────┐                      ┌──────────┐                                              │
+│  │RdKafka client│◄──SIG──┐   ┌───SIG───┤OS signals│                                              │
+│  └──────────────┘        │   │         └──────────┘                                              │
+│                          ▼   ▼                                                                   │
+│                     ┌─────────────┐                                                              │
+│                     │Event Handler│                                                              │
+│                     └─────────────┘                                                              │
+│                            ▲                                                                     │
+│                            │                                                                     │
+│                           SIG                                                                    │
+│                            │                                                                     │
+│                            ▼                                                                     │
+│ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│ │ processing_strategy                                                                          │ │
+│ │ ┌─────────────┐                                                                              │ │
+│ │ │ParMap       │                                                                              │ │
+│ │ │┌───────────┐├────┐                                                                         │ │
+│ │ ││Partition_0││    │                                                                         │ │
+│ │ │└───────────┘│    │                                                                         │ │
+│ │ └─────────────┘    │       ┌──────────┐                   ┌──────────┐                       │ │
+│ │        .           │       │ Reduce_0 │                   │ Reduce_m │        ┌──────┐       │ │
+│ │        .           ├──MSG─►│    /     ├──MSG──►...──MSG──►│    /     │──OFF──►│Commit│       │ │
+│ │        .           │       │  Map_0   │         │         │  Map_m   │        └──────┘       │ │
+│ │ ┌─────────────┐    │       └────┬─────┘         │         └────┬─────┘                       │ │
+│ │ │ParMap       │    │            │               │              │                             │ │
+│ │ │┌───────────┐│    │            └───────────────┼──────────────┘                             │ │
+│ │ ││Partition_n│├────┤                            │                                            │ │
+│ │ │└───────────┘│    │                            │                                            │ │
+│ │ └─────────────┘    │                            │                                            │ │
+│ │                    │                            ▼                                            │ │
+│ │                    │                       ┌──────────┐                                      │ │
+│ │                    └──────────────────────►│Reduce Err│                                      │ │
+│ │                                            └──────────┘                                      │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```

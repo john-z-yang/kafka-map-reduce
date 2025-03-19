@@ -1,6 +1,5 @@
 use crate::{
-    ReduceConfig, ReduceShutdownBehaviour, ReduceShutdownCondition, Reducer,
-    ReducerWhenFullBehaviour,
+    ReduceConfig, ReduceShutdownBehaviour, Reducer, ReducerWhenFullBehaviour, ShutdownCondition,
 };
 use std::{fmt::Debug, marker::PhantomData, time::Duration};
 use tokio::time::sleep;
@@ -62,7 +61,7 @@ where
 
     fn get_reduce_config(&self) -> ReduceConfig {
         ReduceConfig {
-            shutdown_condition: ReduceShutdownCondition::Signal,
+            shutdown_condition: ShutdownCondition::Signal,
             shutdown_behaviour: ReduceShutdownBehaviour::Flush,
             when_full_behaviour: ReducerWhenFullBehaviour::Flush,
             flush_interval: None,

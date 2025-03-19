@@ -1,11 +1,10 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
-use kafka_map_reduce::reducers::clickhouse::ClickhouseBatchWriter;
-use kafka_map_reduce::reducers::noop::NoopReducer;
-use kafka_map_reduce::reducers::os_stream::{OsStream, OsStreamWriter};
-use kafka_map_reduce::{processing_strategy, start_consumer, ReduceShutdownBehaviour};
-use rdkafka::{config::RDKafkaLogLevel, message::OwnedMessage, ClientConfig, Message};
+use kafka_map_reduce::clickhouse::{ClickhouseAckHandler, ClickhouseBatchWriter};
+use kafka_map_reduce::os_stream::{OsStream, OsStreamWriter};
+use kafka_map_reduce::{ReduceShutdownBehaviour, processing_strategy, start_consumer};
+use rdkafka::{ClientConfig, Message, config::RDKafkaLogLevel, message::OwnedMessage};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,23 +101,23 @@ async fn main() -> Result<(), Error> {
             .set("enable.auto.offset.store", "false")
             .set_log_level(RDKafkaLogLevel::Debug),
         processing_strategy!({
-            map: parse,
+            err: OsStreamWriter::new(
+                Duration::from_secs(1),
+                OsStream::StdErr,
+            ),
 
+            par_map: parse,
             reduce: ClickhouseBatchWriter::new(
                 host,
                 port,
                 table,
                 128,
-                Duration::from_secs(4),
+                Duration::from_secs(2),
                 ReduceShutdownBehaviour::Flush,
-            )
-            => NoopReducer::new("hello")
-            => NoopReducer::new("world"),
-
-            err: OsStreamWriter::new(
-                Duration::from_secs(1),
-                OsStream::StdErr,
             ),
+            map: ClickhouseAckHandler{
+                concurrency: 1,
+            },
         }),
     )
     .await

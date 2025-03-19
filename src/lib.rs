@@ -3,6 +3,7 @@ use futures::{
     Stream, StreamExt,
     future::{self},
     pin_mut,
+    stream::FuturesOrdered,
 };
 use rdkafka::{
     ClientConfig, ClientContext, Message, Offset, TopicPartitionList,
@@ -15,7 +16,7 @@ use rdkafka::{
 };
 use std::{
     cmp,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt::Debug,
     future::Future,
     iter,
@@ -39,7 +40,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::{either::Either, sync::CancellationToken};
 use tracing::{debug, error, info, instrument, warn};
 
-pub mod reducers;
+pub mod clickhouse;
+pub mod noop;
+pub mod os_stream;
 
 pub async fn start_consumer(
     topics: &[&str],
@@ -208,57 +211,10 @@ impl ActorHandles {
 #[macro_export]
 macro_rules! processing_strategy {
     (
-        @reducers,
-        ($reduce:expr),
-        $prev_receiver:ident,
-        $err_sender:ident,
-        $shutdown_signal:ident,
-        $handles:ident,
-    ) => {{
-        let (commit_sender, commit_receiver) = tokio::sync::mpsc::channel(1);
-
-        $handles.spawn($crate::reduce(
-            $reduce,
-            $prev_receiver,
-            commit_sender.clone(),
-            $err_sender.clone(),
-            $shutdown_signal.clone(),
-        ));
-
-        (commit_sender, commit_receiver)
-    }};
-    (
-        @reducers,
-        ($reduce_first:expr $(,$reduce_rest:expr)+),
-        $prev_receiver:ident,
-        $err_sender:ident,
-        $shutdown_signal:ident,
-        $handles:ident,
-    ) => {{
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-
-        $handles.spawn($crate::reduce(
-            $reduce_first,
-            $prev_receiver,
-            sender.clone(),
-            $err_sender.clone(),
-            $shutdown_signal.clone(),
-        ));
-
-        processing_strategy!(
-            @reducers,
-            ($($reduce_rest),+),
-            receiver,
-            $err_sender,
-            $shutdown_signal,
-            $handles,
-        )
-    }};
-    (
         {
-            map: $map_fn:expr,
-            reduce: $reduce_first:expr $(=> $reduce_rest:expr)*,
             err: $reduce_err:expr,
+            par_map: $map_fn:expr,
+            $($rest:tt)*
         }
     ) => {{
         |consumer: Arc<rdkafka::consumer::StreamConsumer<$crate::KafkaContext>>,
@@ -272,7 +228,7 @@ macro_rules! processing_strategy {
             let (rendezvous_sender, rendezvous_receiver) = tokio::sync::oneshot::channel();
 
             const CHANNEL_BUFF_SIZE: usize = 1024;
-            let (map_sender, reduce_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
+            let (map_sender, next_step_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
             let (err_sender, err_receiver) = tokio::sync::mpsc::channel(CHANNEL_BUFF_SIZE);
 
             for (topic, partition) in tpl.iter() {
@@ -280,7 +236,7 @@ macro_rules! processing_strategy {
                     .split_partition_queue(topic, *partition)
                     .expect("Topic and parition should always be splittable");
 
-                handles.spawn($crate::map(
+                handles.spawn($crate::par_map(
                     queue,
                     $map_fn,
                     map_sender.clone(),
@@ -289,13 +245,15 @@ macro_rules! processing_strategy {
                 ));
             }
 
-            let (_, commit_receiver) = $crate::processing_strategy!(
-                @reducers,
-                ($reduce_first $(,$reduce_rest)*),
-                reduce_receiver,
+            let commit_receiver = $crate::processing_strategy!(
+                @with_ctx,
+
+                next_step_receiver,
                 err_sender,
                 shutdown_signal,
                 handles,
+
+                $($rest)*
             );
 
             handles.spawn($crate::commit(
@@ -318,6 +276,85 @@ macro_rules! processing_strategy {
                 rendezvous: rendezvous_receiver,
             }
         }
+    }};
+
+    (
+        @with_ctx,
+
+        $prev_receiver:ident,
+        $err_sender:ident,
+        $shutdown_signal:ident,
+        $handles:ident,
+
+        reduce: $reducer:expr,
+        $($rest:tt)*
+
+    ) => {{
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+
+        $handles.spawn($crate::reduce(
+            $reducer,
+            $prev_receiver,
+            sender.clone(),
+            $err_sender.clone(),
+            $shutdown_signal.clone(),
+        ));
+
+        processing_strategy!(
+            @with_ctx,
+
+            receiver,
+            $err_sender,
+            $shutdown_signal,
+            $handles,
+
+            $($rest)*
+        )
+    }};
+
+    (
+        @with_ctx,
+
+        $prev_receiver:ident,
+        $err_sender:ident,
+        $shutdown_signal:ident,
+        $handles:ident,
+
+        map: $mapper:expr,
+        $($rest:tt)*
+
+    ) => {{
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+
+        $handles.spawn($crate::map(
+            $mapper,
+            $prev_receiver,
+            sender.clone(),
+            $err_sender.clone(),
+            $shutdown_signal.clone(),
+        ));
+
+        processing_strategy!(
+            @with_ctx,
+
+            receiver,
+            $err_sender,
+            $shutdown_signal,
+            $handles,
+
+            $($rest)*
+        )
+    }};
+
+    (
+        @with_ctx,
+
+        $prev_receiver:ident,
+        $err_sender:ident,
+        $shutdown_signal:ident,
+        $handles:ident,
+    ) => {{
+        $prev_receiver
     }};
 }
 
@@ -427,7 +464,7 @@ impl MessageQueue for StreamPartitionQueue<KafkaContext> {
 }
 
 #[instrument(skip_all)]
-pub async fn map<T, F>(
+pub async fn par_map<T, F>(
     queue: impl MessageQueue,
     transform: impl Fn(Arc<OwnedMessage>) -> F,
     ok: mpsc::Sender<(iter::Once<OwnedMessage>, T)>,
@@ -486,15 +523,143 @@ where
 }
 
 #[derive(Debug, Clone)]
+pub struct MapConfig {
+    pub concurrency: usize,
+    pub shutdown_condition: ShutdownCondition,
+    pub shutdown_behaviour: MapShutdownBehaviour,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapShutdownBehaviour {
+    Drain,
+    Drop,
+}
+
+pub trait Mapper {
+    type Input;
+    type Output;
+
+    fn map(
+        &self,
+        t: Self::Input,
+    ) -> impl Future<Output = Result<Self::Output, anyhow::Error>> + Send;
+    fn get_map_config(&self) -> MapConfig;
+}
+
+#[instrument(skip_all)]
+async fn drain_work_buffer<Fut, T>(
+    mut work_buffer: FuturesOrdered<Fut>,
+    mut inflight_msgs: VecDeque<Vec<OwnedMessage>>,
+    ok: mpsc::Sender<(Vec<OwnedMessage>, T)>,
+    err: mpsc::Sender<OwnedMessage>,
+) -> Result<(), Error>
+where
+    Fut: Future<Output = Result<T, anyhow::Error>>,
+{
+    while let Some(res) = work_buffer.next().await {
+        let inflight_msg = inflight_msgs.pop_front().expect(
+            "The number of inflight messages should be equal to the number of ongoing map futures",
+        );
+        match res {
+            Ok(res) => ok
+                .send((inflight_msg, res))
+                .await
+                .map_err(|err| anyhow!("{}", err))?,
+            Err(e) => {
+                error!("Failed to apply mapper, reason: {}", e);
+                for msg in inflight_msg.into_iter() {
+                    err.send(msg)
+                        .await
+                        .expect("reduce_err should always be available");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn map<T, U>(
+    mapper: impl Mapper<Input = T, Output = U>,
+    mut receiver: mpsc::Receiver<(impl IntoIterator<Item = OwnedMessage>, T)>,
+    ok: mpsc::Sender<(Vec<OwnedMessage>, U)>,
+    err: mpsc::Sender<OwnedMessage>,
+    shutdown: CancellationToken,
+) -> Result<(), Error> {
+    let config = mapper.get_map_config();
+
+    let mut work_buffer = FuturesOrdered::new();
+    let mut inflight_msgs = VecDeque::with_capacity(config.concurrency);
+
+    loop {
+        select! {
+            biased;
+
+            _ = if config.shutdown_condition == ShutdownCondition::Signal {
+                Either::Left(shutdown.cancelled())
+            } else {
+                Either::Right(future::pending::<_>())
+            } => {
+                match config.shutdown_behaviour {
+                    MapShutdownBehaviour::Drain => {
+                        debug!("Received shutdown signal, draining mapper work queue...");
+                        drain_work_buffer(work_buffer, inflight_msgs, ok, err).await?;
+                    },
+                    MapShutdownBehaviour::Drop => {
+                        debug!("Received shutdown signal, dropping mapper work queue...");
+                        drop(work_buffer);
+                    },
+                }
+                break;
+            }
+
+            Some(res) = work_buffer.next(), if !work_buffer.is_empty() => {
+                let inflight_msg = inflight_msgs.pop_back().expect(
+                    "The number of inflight messages should be equal to \
+                     the number of ongoing map futures",
+                );
+                match res {
+                    Ok(res) => {
+                        ok.send((inflight_msg, res)).await.map_err(|err| anyhow!("{}", err))?;
+                    },
+                    Err(e) => {
+                        error!("Failed to apply mapper, reason: {}", e);
+                        for msg in inflight_msg.into_iter() {
+                            err.send(msg)
+                                .await
+                                .expect("reduce_err should always be available");
+                        }
+                    },
+                };
+            },
+
+            val = receiver.recv(), if work_buffer.len() < config.concurrency => {
+                let Some((msg, value)) = val else {
+                    assert_eq!(
+                        config.shutdown_condition,
+                        ShutdownCondition::Drain,
+                        "Got end of stream without shutdown signal"
+                    );
+                    break;
+                };
+                inflight_msgs.push_front(msg.into_iter().collect());
+                work_buffer.push_front(mapper.map(value));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
 pub struct ReduceConfig {
-    pub shutdown_condition: ReduceShutdownCondition,
+    pub shutdown_condition: ShutdownCondition,
     pub shutdown_behaviour: ReduceShutdownBehaviour,
     pub when_full_behaviour: ReducerWhenFullBehaviour,
     pub flush_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReduceShutdownCondition {
+pub enum ShutdownCondition {
     Signal,
     Drain,
 }
@@ -576,7 +741,7 @@ pub async fn reduce<T, U>(
         select! {
             biased;
 
-            _ = if config.shutdown_condition == ReduceShutdownCondition::Signal {
+            _ = if config.shutdown_condition == ShutdownCondition::Signal {
                 Either::Left(shutdown.cancelled())
             } else {
                 Either::Right(future::pending::<_>())
@@ -606,7 +771,7 @@ pub async fn reduce<T, U>(
                 let Some((msg, value)) = val else {
                     assert_eq!(
                         config.shutdown_condition,
-                        ReduceShutdownCondition::Drain,
+                        ShutdownCondition::Drain,
                         "Got end of stream without shutdown signal"
                     );
                     match config.shutdown_behaviour {
@@ -665,7 +830,7 @@ pub async fn reduce_err(
         select! {
             biased;
 
-            _ = if config.shutdown_condition == ReduceShutdownCondition::Signal {
+            _ = if config.shutdown_condition == ShutdownCondition::Signal {
                 Either::Left(shutdown.cancelled())
             } else {
                 Either::Right(future::pending::<_>())
@@ -701,7 +866,7 @@ pub async fn reduce_err(
                 let Some(msg) = val else {
                     assert_eq!(
                         config.shutdown_condition,
-                        ReduceShutdownCondition::Drain,
+                        ShutdownCondition::Drain,
                         "Got end of stream without shutdown signal"
                     );
                     match config.shutdown_behaviour {
@@ -809,7 +974,6 @@ mod tests {
     use std::{
         collections::HashMap,
         iter,
-        marker::PhantomData,
         mem::take,
         sync::{Arc, RwLock},
         time::Duration,
@@ -830,10 +994,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        CommitClient, KafkaMessage, MessageQueue, ReduceConfig, ReduceShutdownBehaviour,
-        ReduceShutdownCondition, Reducer, ReducerWhenFullBehaviour, commit, map,
-        processing_strategy, reduce, reduce_err, reducers::os_stream::OsStream,
-        reducers::os_stream::OsStreamWriter,
+        CommitClient, KafkaMessage, MessageQueue, ReduceConfig, ReduceShutdownBehaviour, Reducer,
+        ReducerWhenFullBehaviour, ShutdownCondition, commit,
+        noop::{NoopMapper, NoopReducer},
+        os_stream::{OsStream, OsStreamWriter},
+        par_map, processing_strategy, reduce, reduce_err,
     };
 
     struct MockCommitClient {
@@ -905,7 +1070,7 @@ mod tests {
 
         fn get_reduce_config(&self) -> ReduceConfig {
             ReduceConfig {
-                shutdown_condition: ReduceShutdownCondition::Signal,
+                shutdown_condition: ShutdownCondition::Signal,
                 shutdown_behaviour: ReduceShutdownBehaviour::Drop,
                 when_full_behaviour: ReducerWhenFullBehaviour::Flush,
                 flush_interval: None,
@@ -918,14 +1083,14 @@ mod tests {
         pipe: Arc<RwLock<Vec<T>>>,
         error_on_nth_reduce: Option<usize>,
         error_on_nth_flush: Option<usize>,
-        shutdown_condition: ReduceShutdownCondition,
+        shutdown_condition: ShutdownCondition,
     }
 
     impl<T> BatchingReducer<T> {
         fn new(
             error_on_reduce: Option<usize>,
             error_on_flush: Option<usize>,
-            shutdown_condition: ReduceShutdownCondition,
+            shutdown_condition: ShutdownCondition,
         ) -> Self {
             Self {
                 buffer: Arc::new(RwLock::new(Vec::new())),
@@ -1221,7 +1386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reduce_err_with_flush_interval() {
-        let reducer = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
+        let reducer = BatchingReducer::new(None, None, ShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1251,7 +1416,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reduce_with_flush_interval() {
-        let reducer = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
+        let reducer = BatchingReducer::new(None, None, ShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1308,7 +1473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_on_reduce_with_flush_interval() {
-        let reducer = BatchingReducer::new(Some(1), None, ReduceShutdownCondition::Signal);
+        let reducer = BatchingReducer::new(Some(1), None, ShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1385,7 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_on_flush() {
-        let reducer = BatchingReducer::new(None, Some(1), ReduceShutdownCondition::Signal);
+        let reducer = BatchingReducer::new(None, Some(1), ShutdownCondition::Signal);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1477,11 +1642,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_sequential_reducers() {
-        let reducer_0 = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
+        let reducer_0 = BatchingReducer::new(None, None, ShutdownCondition::Signal);
         let buffer_0 = reducer_0.get_buffer();
         let pipe_0 = reducer_0.get_pipe();
 
-        let reducer_1 = BatchingReducer::new(None, None, ReduceShutdownCondition::Signal);
+        let reducer_1 = BatchingReducer::new(None, None, ShutdownCondition::Signal);
         let buffer_1 = reducer_1.get_buffer();
         let pipe_1 = reducer_1.get_pipe();
 
@@ -1557,7 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reduce_shutdown_from_drain() {
-        let reducer = BatchingReducer::new(None, None, ReduceShutdownCondition::Drain);
+        let reducer = BatchingReducer::new(None, None, ShutdownCondition::Drain);
         let buffer = reducer.get_buffer();
         let pipe = reducer.get_pipe();
 
@@ -1650,7 +1815,7 @@ mod tests {
         let (err_sender, err_receiver) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
 
-        tokio::spawn(map(
+        tokio::spawn(par_map(
             receiver,
             |msg| async move { Ok(msg.payload().unwrap()[0] * 2) },
             ok_sender,
@@ -1702,7 +1867,7 @@ mod tests {
         let (err_sender, mut err_receiver) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
 
-        tokio::spawn(map(
+        tokio::spawn(par_map(
             receiver,
             |msg| async move {
                 if msg.payload().unwrap()[0] == 1 {
@@ -1765,76 +1930,20 @@ mod tests {
         assert!(err_receiver.is_closed());
     }
 
-    pub struct NoopReducer<T> {
-        phantom: PhantomData<T>,
-    }
-
-    impl<T> NoopReducer<T> {
-        pub fn new() -> Self {
-            Self {
-                phantom: PhantomData,
-            }
-        }
-    }
-
-    impl<T> Reducer for NoopReducer<T>
-    where
-        T: Send + Sync,
-    {
-        type Input = T;
-        type Output = ();
-
-        async fn reduce(&mut self, _t: Self::Input) -> Result<(), anyhow::Error> {
-            Ok(())
-        }
-
-        async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
-            Ok(Some(()))
-        }
-
-        fn reset(&mut self) {}
-
-        async fn is_full(&self) -> bool {
-            false
-        }
-
-        fn get_reduce_config(&self) -> ReduceConfig {
-            ReduceConfig {
-                shutdown_condition: ReduceShutdownCondition::Drain,
-                shutdown_behaviour: ReduceShutdownBehaviour::Flush,
-                when_full_behaviour: ReducerWhenFullBehaviour::Flush,
-                flush_interval: Some(Duration::from_secs(1)),
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_processing_strategy_can_compile() {
         let _ = processing_strategy!({
-            map:
-                |_: Arc<OwnedMessage>| async move { Ok(()) },
-            reduce:
-                NoopReducer::new()
-                => NoopReducer::new()
-                => NoopReducer::new()
-                => NoopReducer::new(),
             err:
                 OsStreamWriter::new(
                     Duration::from_secs(1),
                     OsStream::StdErr,
                 ),
-        });
 
-        let _ = processing_strategy!({
-            map:
-                |_: Arc<OwnedMessage>| async move { Ok(()) },
-            reduce:
-                NoopReducer::new(),
-            err:
-                OsStreamWriter::new(
-                    Duration::from_secs(1),
-                    OsStream::StdErr,
-                ),
+            par_map: |_: Arc<OwnedMessage>| async move { Ok(()) },
+            reduce: NoopReducer::new("1"),
+            map: NoopMapper::new("2"),
+            reduce: NoopReducer::new("3"),
+
         });
     }
 }

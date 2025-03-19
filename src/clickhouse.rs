@@ -1,11 +1,15 @@
 use crate::{
-    ReduceConfig, ReduceShutdownBehaviour, ReduceShutdownCondition, Reducer,
-    ReducerWhenFullBehaviour,
+    MapConfig, MapShutdownBehaviour, Mapper, ReduceConfig, ReduceShutdownBehaviour, Reducer,
+    ReducerWhenFullBehaviour, ShutdownCondition,
 };
 use anyhow::{Error, Ok, anyhow};
 use reqwest::{Client, Response};
-use std::{collections::HashMap, time::Duration};
-use tokio::{sync::mpsc, task::JoinHandle};
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::{
+    sync::mpsc,
+    task::{JoinError, JoinHandle},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
@@ -84,7 +88,7 @@ impl ClickhouseBatchWriter {
                 host, port, table
             ),
             reduce_config: ReduceConfig {
-                shutdown_condition: ReduceShutdownCondition::Signal,
+                shutdown_condition: ShutdownCondition::Signal,
                 shutdown_behaviour,
                 when_full_behaviour: ReducerWhenFullBehaviour::Backpressure,
                 flush_interval: Some(flush_interval),
@@ -95,7 +99,7 @@ impl ClickhouseBatchWriter {
 
 impl Reducer for ClickhouseBatchWriter {
     type Input = Vec<u8>;
-    type Output = ();
+    type Output = JoinHandle<Result<Result<Response, anyhow::Error>, JoinError>>;
 
     async fn reduce(&mut self, t: Self::Input) -> Result<(), anyhow::Error> {
         self.write_handle
@@ -111,28 +115,12 @@ impl Reducer for ClickhouseBatchWriter {
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<Option<()>, anyhow::Error> {
-        if self.write_handle.is_none() {
+    async fn flush(&mut self) -> Result<Option<Self::Output>, anyhow::Error> {
+        let Some(write_handle) = self.write_handle.take() else {
             return Ok(None);
-        }
-        let res = self.write_handle.take().unwrap().flush().await??;
+        };
 
-        if res.status().as_str() == "200" {
-            info!(
-                "Inserted: {:?} rows, query ID: {:?}",
-                res.headers()
-                    .get("x-clickhouse-summary")
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|s| serde_json::from_str::<HashMap<String, String>>(s).ok())
-                    .and_then(|map| map.get("written_rows").cloned())
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap(),
-                res.headers().get("x-clickhouse-query-id").unwrap(),
-            );
-            Ok(Some(()))
-        } else {
-            Err(anyhow!("Write failed: {:?}", res))
-        }
+        Ok(Some(tokio::spawn(write_handle.flush())))
     }
 
     fn reset(&mut self) {
@@ -153,5 +141,44 @@ impl Reducer for ClickhouseBatchWriter {
 impl Drop for ClickhouseBatchWriter {
     fn drop(&mut self) {
         self.write_handle.as_ref().map(WriteHandle::abort);
+    }
+}
+
+pub struct ClickhouseAckHandler {
+    pub concurrency: usize,
+}
+
+impl Mapper for ClickhouseAckHandler {
+    type Input = JoinHandle<Result<Result<Response, anyhow::Error>, JoinError>>;
+
+    type Output = ();
+
+    async fn map(&self, t: Self::Input) -> Result<Self::Output, anyhow::Error> {
+        let resp = t.await???;
+
+        if resp.status().as_str() == "200" {
+            info!(
+                "Inserted: {:?} rows, query ID: {:?}",
+                resp.headers()
+                    .get("x-clickhouse-summary")
+                    .and_then(|val| val.to_str().ok())
+                    .and_then(|s| serde_json::from_str::<HashMap<String, String>>(s).ok())
+                    .and_then(|map| map.get("written_rows").cloned())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap(),
+                resp.headers().get("x-clickhouse-query-id").unwrap(),
+            );
+            Ok(())
+        } else {
+            Err(anyhow!("Write failed: {:?}", resp))
+        }
+    }
+
+    fn get_map_config(&self) -> MapConfig {
+        MapConfig {
+            concurrency: self.concurrency,
+            shutdown_condition: ShutdownCondition::Drain,
+            shutdown_behaviour: MapShutdownBehaviour::Drain,
+        }
     }
 }
