@@ -13,6 +13,7 @@ use rdkafka::{
     },
     error::{KafkaError, KafkaResult},
     message::{BorrowedMessage, OwnedMessage},
+    types::RDKafkaErrorCode,
 };
 use std::{
     cmp,
@@ -28,12 +29,13 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    runtime::Handle,
     select,
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel},
         oneshot,
     },
-    task::JoinSet,
+    task::{self, JoinSet},
     time::{self, MissedTickBehavior, sleep},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -99,20 +101,33 @@ pub fn handle_shutdown_signals<T, F>(
 #[instrument(skip(consumer, shutdown))]
 pub fn handle_consumer_client(
     consumer: Arc<StreamConsumer<KafkaContext>>,
-    shutdown: oneshot::Receiver<()>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
-    tokio::spawn(async move {
-        select! {
-            biased;
-            _ = shutdown => {
-                debug!("Received shutdown signal, commiting state in sync mode...");
-                let _ = consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync);
+    task::spawn_blocking(|| {
+        Handle::current().block_on(async move {
+            loop {
+                select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        debug!("Received shutdown signal, commiting state in sync mode...");
+                        let _ = consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync);
+                        break;
+                    }
+                    msg = consumer.recv() => {
+                        if let Err(KafkaError::MessageConsumption(
+                            RDKafkaErrorCode::BrokerTransportFailure,
+                        )) = msg
+                        {
+                            error!("Failed to connect to broker, retrying...")
+                        } else {
+                            error!("Got unexpected status from consumer client: {:?}", msg);
+                            break
+                        }
+                    }
+                }
             }
-            _ = consumer.recv() => {
-                panic!("We're cooked");
-            }
-        }
-        debug!("Shutdown complete");
+            debug!("Shutdown complete");
+        })
     });
 }
 
