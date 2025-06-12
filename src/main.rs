@@ -8,6 +8,7 @@ use rdkafka::{ClientConfig, Message, config::RDKafkaLogLevel, message::OwnedMess
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::signal;
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug, Serialize)]
@@ -119,6 +120,7 @@ async fn main() -> Result<(), Error> {
                 concurrency: 1,
             },
         }),
+        signal::ctrl_c(),
     )
     .await
 }

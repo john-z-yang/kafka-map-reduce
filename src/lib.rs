@@ -28,7 +28,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    select, signal,
+    select,
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel},
         oneshot,
@@ -44,14 +44,18 @@ pub mod clickhouse;
 pub mod noop;
 pub mod os_stream;
 
-pub async fn start_consumer(
+pub async fn start_consumer<T, F>(
     topics: &[&str],
     kafka_client_config: &ClientConfig,
     spawn_actors: impl FnMut(
         Arc<StreamConsumer<KafkaContext>>,
         &BTreeSet<(String, i32)>,
     ) -> ActorHandles,
-) -> Result<(), Error> {
+    shutdown_signal: F,
+) -> Result<(), Error>
+where
+    F: Future<Output = T> + Send + 'static,
+{
     let (client_shutdown_sender, client_shutdown_receiver) = oneshot::channel();
     let (event_sender, event_receiver) = unbounded_channel();
 
@@ -67,7 +71,7 @@ pub async fn start_consumer(
         .subscribe(topics)
         .expect("Can't subscribe to specified topics");
 
-    handle_os_signals(event_sender.clone());
+    handle_shutdown_signals(event_sender.clone(), shutdown_signal);
     handle_consumer_client(consumer.clone(), client_shutdown_receiver);
     handle_events(
         consumer,
@@ -78,9 +82,14 @@ pub async fn start_consumer(
     .await
 }
 
-pub fn handle_os_signals(event_sender: UnboundedSender<(Event, SyncSender<()>)>) {
+pub fn handle_shutdown_signals<T, F>(
+    event_sender: UnboundedSender<(Event, SyncSender<()>)>,
+    shutdown_signal: F,
+) where
+    F: Future<Output = T> + Send + 'static,
+{
     tokio::spawn(async move {
-        let _ = signal::ctrl_c().await;
+        let _ = shutdown_signal.await;
         let (rendezvous_sender, rendezvous_receiver) = sync_channel(0);
         let _ = event_sender.send((Event::Shutdown, rendezvous_sender));
         let _ = rendezvous_receiver.recv();
